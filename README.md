@@ -84,12 +84,12 @@ python examples/metal_verify.py
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | import / JIT 编译 / `get_kernel_source()` | ✅ | 自动检出 `metal` target，输出真实 Metal shader |
-| `T.Parallel` 类内核（vector add、2D elementwise） | ✅ | 运行结果与 torch 一致 |
-| 共享内存 + 串行归约（第 03 章 softmax） | ✅ | 需 `threads ≤ 32`（见下） |
-| 性能分析 `do_bench()` | ⚠️ | CUDA event 路径不可用，改用 torch 计时 |
-| `T.gemm`（Tensor Core 风格） | ❌ | 0.1.13 Metal codegen 限制（shared 指针地址空间符），需 CUDA GPU 或更新版本 |
-| `T.infinity` | ❌ | 用大负数字面量代替 |
-| 多 simdgroup 复制循环（threads > 32） | ⚠️ | 0.1.13 后端缺陷：串行复制循环结果错，用 `threads ≤ 32` |
+| `T.Parallel` 类内核（vector add、2D elementwise） | ✅ | **与 GPU/CUDA 写法完全一致，零改动** |
+| 共享内存 + 串行归约（第 03 章 softmax） | ✅ | 需 `threads ≤ 32`（GPU/CUDA 标准写法：`threads=128/256` 任意取值） |
+| 性能分析 `do_bench()` | ⚠️ | CUDA event 路径不可用，改用 torch 计时（GPU/CUDA 标准写法：`kernel.get_profiler().do_bench()`） |
+| `T.gemm`（Tensor Core 风格） | ❌ | 0.1.13 Metal codegen 限制（shared 指针地址空间符），需 CUDA GPU 或更新版本；**代码与 GPU 写法相同，换机即跑** |
+| `T.infinity` | ❌ | 用大负数字面量代替（GPU/CUDA 标准写法：`T.infinity(dtype)`） |
+| 多 simdgroup 复制循环（threads > 32） | ⚠️ | 0.1.13 后端缺陷：串行复制循环结果错，用 `threads ≤ 32`（GPU/CUDA 上无此问题） |
 
 要点：**本机适合学习语法与跑 elementwise/reduce/softmax 类内核**；第 05/06 章的
 GEMM/FlashAttention（依赖 `T.gemm`）请在 NVIDIA GPU（本地或云）上运行，代码无需
