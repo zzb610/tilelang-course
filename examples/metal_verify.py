@@ -1,0 +1,74 @@
+"""macOS (Apple Silicon / Metal) 后端验证通过的示例
+运行: .venv/bin/python examples/metal_verify.py
+
+注意（2026-08，tilelang 0.1.13 macOS arm64 wheel）：
+- T.Parallel / T.copy / alloc_shared / 串行归约（threads<=32）在 Metal 上验证可用；
+- Metal 后端暂不支持 T.infinity（用大负数字面量代替）；
+- threads>32 时多 simdgroup 的“全线程复制串行循环”结果错误（后端缺陷，用 threads<=32）；
+- T.gemm 在 Metal 后端 0.1.13 存在 codegen 限制（shared 指针地址空间限定符），
+  请在 CUDA GPU 上运行第 05/06 章的 GEMM/FlashAttention 示例。
+"""
+import torch
+import tilelang
+import tilelang.language as T
+from tilelang import jit
+
+
+@jit
+def softmax_rows(N: int, threads: int = 32, dtype: str = 'float32'):
+    """第 03 章：分块 softmax（每 block 一行，shared 中转；Metal 上 threads<=32）"""
+    @T.prim_func
+    def kern(A: T.Tensor((N, N), dtype), O: T.Tensor((N, N), dtype)):
+        with T.Kernel(N, threads=threads) as bx:
+            row_s = T.alloc_shared((N,), dtype)
+            row_max = T.alloc_var(dtype)
+            row_sum = T.alloc_var(dtype)
+            T.copy(A[bx, 0], row_s)
+            row_max = -1e30                       # Metal 后端暂不支持 T.infinity
+            for j in T.serial(N):
+                row_max = T.max(row_max, row_s[j])
+            row_sum = 0
+            for j in T.serial(N):
+                row_s[j] = T.exp(row_s[j] - row_max)
+                row_sum += row_s[j]
+            for j in T.serial(N):
+                row_s[j] = row_s[j] / row_sum
+            T.copy(row_s, O[bx, 0])
+    return kern
+
+
+@jit
+def vector_add(N: int, block: int = 256, dtype: str = 'float32'):
+    """第 01 章：向量加法（Metal 验证通过）"""
+    @T.prim_func
+    def kern(A: T.Tensor((N,), dtype), B: T.Tensor((N,), dtype),
+             C: T.Tensor((N,), dtype)):
+        with T.Kernel(T.ceildiv(N, block), threads=block) as bx:
+            for i in T.Parallel(block):
+                gi = bx * block + i
+                C[gi] = A[gi] + B[gi]
+    return kern
+
+
+if __name__ == "__main__":
+    dev = "mps:0"
+
+    N = 1 << 20
+    a = torch.randn(N, device=dev)
+    b = torch.randn(N, device=dev)
+    k1 = vector_add(N)
+    c = torch.empty(N, device=dev)
+    k1(a, b, c)
+    torch.testing.assert_close(c, a + b)
+    print("✓ vector add")
+
+    N = 256
+    A = torch.randn(N, N, device=dev)
+    O = torch.empty(N, N, device=dev)
+    k2 = softmax_rows(N, threads=32)
+    k2(A, O)
+    torch.testing.assert_close(O, torch.softmax(A, dim=-1), rtol=1e-4, atol=1e-6)
+    print("✓ 分块 softmax（threads=32）")
+
+    src = k2.get_kernel_source()
+    print("✓ 生成 Metal 源码可查看（长度", len(src), "字符）")

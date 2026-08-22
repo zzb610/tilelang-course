@@ -67,6 +67,34 @@ epilogue（如 GELU、分组统计），提交 PR 或写博客。
 - `pip install tilelang`（详见第 01 章）
 - 熟悉 PyTorch 基本用法（用于正确性验证与基准对比）
 
+## 本机（macOS Apple Silicon）已安装的运行环境
+
+本仓库已自带一个可用的虚拟环境（2026-08 实机验证，`tilelang 0.1.13` + `torch 2.13`）：
+
+```bash
+# 激活后即可使用 tilelang
+source .venv/bin/activate
+
+# 端到端验证（vector add + 分块 softmax + Metal 源码查看）
+python examples/metal_verify.py
+```
+
+### macOS / Metal 后端实测结论（tilelang 0.1.13）
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| import / JIT 编译 / `get_kernel_source()` | ✅ | 自动检出 `metal` target，输出真实 Metal shader |
+| `T.Parallel` 类内核（vector add、2D elementwise） | ✅ | 运行结果与 torch 一致 |
+| 共享内存 + 串行归约（第 03 章 softmax） | ✅ | 需 `threads ≤ 32`（见下） |
+| 性能分析 `do_bench()` | ⚠️ | CUDA event 路径不可用，改用 torch 计时 |
+| `T.gemm`（Tensor Core 风格） | ❌ | 0.1.13 Metal codegen 限制（shared 指针地址空间符），需 CUDA GPU 或更新版本 |
+| `T.infinity` | ❌ | 用大负数字面量代替 |
+| 多 simdgroup 复制循环（threads > 32） | ⚠️ | 0.1.13 后端缺陷：串行复制循环结果错，用 `threads ≤ 32` |
+
+要点：**本机适合学习语法与跑 elementwise/reduce/softmax 类内核**；第 05/06 章的
+GEMM/FlashAttention（依赖 `T.gemm`）请在 NVIDIA GPU（本地或云）上运行，代码无需
+修改——课程示例以 CUDA 为准。
+
 ## 参考资源
 
 - 官方仓库：<https://github.com/tile-ai/tilelang>
