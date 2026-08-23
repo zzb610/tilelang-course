@@ -17,6 +17,8 @@
 - [Instruction Guide](https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md)：GEMM、归约、同步和调试原语。
 - [Software Pipeline Guide](https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/software_pipeline.md)：`T.Pipelined`、`stage/order` 和 replayable Bind。
 - [官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)：建议与第 05 章并排阅读。
+- [Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)：第 13 章的前向、反向和 pointer-style 参考实现。
+- [Fused-MoE TileLang 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)：观察 token dispatch、group metadata、grouped GEMM 和 scatter 的端到端组合。
 - [官方 examples 目录](https://github.com/tile-ai/tilelang/tree/main/examples)：按 GEMM、attention、归约、量化和架构筛选实验。
 
 ## CUDA 相关资源
@@ -33,4 +35,5 @@
 2. 本教程第 01～04 章；
 3. 官方 GEMM 示例 → Software Pipeline Guide；
 4. 本教程第 05～09 章；
-5. 目标 GPU 对应的 CUDA Guide、Best Practices 和 Nsight 文档。
+5. 若涉及 MoE 或不规则批量矩阵乘，再读第 13 章和官方 Grouped GEMM examples；
+6. 目标 GPU 对应的 CUDA Guide、Best Practices 和 Nsight 文档。

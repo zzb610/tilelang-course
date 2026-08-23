@@ -1,8 +1,8 @@
-# 第 05 章 GEMM 实战：从朴素实现到接近峰值
+# 第 05 章 GEMM 实战：从朴素实现到可测优化
 
-> **本章目标**：亲手写出并优化一个 FP16 GEMM，走完「朴素 → 分块 → 流水线 →
-> swizzle → 自动调优」全流程，并用 profiler 量化每一步的收益。GEMM 是 GPU 内核
-> 面试的"hello world"，本章结束后你要能**闭着眼画出它的数据流并口述优化顺序**。
+> **本章目标**：围绕同一个 FP16 GEMM，按“正确基线 → 数据复用 → 流水线 → 布局/调度
+> → 自动调优”的顺序做实验。每一版只改变一个主要因素，并用正确性、生成代码和
+> profiler 说明收益来自哪里；本章不承诺任何固定的峰值比例。
 
 **学习信息**
 
@@ -12,6 +12,10 @@
 - 本章产出：一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表和一份 TFLOPS 报告。
 - 参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、[TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
 
+**阅读路线：**先用 v0 建立“能算对但访存重复”的对照，再只引入 shared tile，随后引入
+流水线。v2 专门处理任意尺寸，v3 只做布局和 block 调度实验，v4 才把已知的参数空间
+交给 autotune。每次实验都保留上一版，避免把多个变化混成一个“黑盒加速”。
+
 ## 5.1 问题与理论峰值
 
 计算 `C[M,N] = A[M,K] × B[K,N]`（行主序）。
@@ -19,14 +23,18 @@
 - 计算量：`2·M·N·K` FLOPs；
 - 理论峰值取决于 GPU 型号、dtype、稀疏模式、时钟和库路径；请把目标 GPU 的官方规格
   填入实验记录，不要把某张卡的数字当作课程常数；
-- 目标不是"跑得快"，是**逼近硬件峰值的前提下找证据**（面试官最恨"我感觉很快"）。
+- 目标不是只追求一个快的数字，而是在明确硬件和测量方法的前提下找到证据。
 
 衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。与 cuBLAS/torch 的比较必须
 使用相同输入、dtype、warmup、rep 和同步方式；不要把历史 benchmark 数字直接套到自己的机器。
 
+这里的公式把延迟单位写成毫秒；等价地，也可以先把延迟换算成秒，再除以 `1e12`。
+如果只统计 A/B 的读取或使用了不同的矩阵乘定义，应在报告中明确说明 FLOPs 口径。
+
 ## 5.2 版本 0：不碰共享内存（教学用）
 
-每个 block 算一个 `BM×BN` 输出 tile，直接从全局内存累加（K 维每步都读全局）：
+每个 block 算一个 `BM×BN` 输出 tile，直接从全局内存累加（K 维每步都读全局）。为
+突出访存差异，下面的 v0 只用于整除尺寸；尾部处理留到 5.4：
 
 ```python
 import torch
@@ -89,7 +97,7 @@ def gemm_v1(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
     return kern
 ```
 
-逐行解读（面试口述版）：
+逐行解读：
 
 1. 网格：`(N/BN) × (M/BM)` 个 block，每个 block 负责一个 `BM×BN` 的输出 tile；
 2. **两级缓冲**：数据从 global 进 shared（`A_s/B_s`），再从 shared 进寄存器累加器
@@ -113,7 +121,7 @@ ref = A.to(torch.float32) @ B.to(torch.float32)
 torch.testing.assert_close(C.float(), ref, rtol=1e-2, atol=1e-2)
 
 lat = kernel.get_profiler().do_bench()
-print(f"latency={lat:.3f} ms, {2*M*N*K/lat/1e6:.1f} TFLOPS")
+print(f"latency={lat:.3f} ms, {2*M*N*K/lat/1e9:.1f} TFLOPS")
 ```
 
 > 本示例 M/N/K 都是 tile 的整数倍，无边界问题；非整除见 5.4。
@@ -250,11 +258,11 @@ lat_ref = profiler.do_bench(torch_gemm, warmup=25, rep=100)
 print(kernel.get_kernel_source()[:3000])
 ```
 
-看生成代码时的观察点（面试可聊）：`T.gemm` 变成了什么（`mma.sync` / `wmma` /
+看生成代码时的观察点：`T.gemm` 变成了什么（`mma.sync` / `wmma` /
 `wgmma` 等）；`T.copy` 是否变成 `cp.async` + 屏障；K 循环是否出现 prologue/
 steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 
-## 5.8 进阶方向（一句话认识，面试不虚）
+## 5.8 进阶方向（先知道它们解决什么问题）
 
 | 方向 | 解决什么 | 官方示例 |
 |---|---|---|
@@ -266,11 +274,11 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 
 ## 5.9 本章小结
 
-- 朴素版死因是**无数据复用**；分块 + shared + 流水线是 GEMM 的标准答案。
+- 朴素版的主要问题是**缺少数据复用**；分块、shared 和流水线构成常见的优化路径。
 - 优化顺序：正确基线 → `T.Pipelined` → swizzle 布局 → 光栅化 → autotune → 逐项
   用 TFLOPS 验证。
 - `T.gemm` 是 tile 级原语：内部完成布局分发与 Tensor Core 指令选择。
-- 面试黄金句：**"GEMM 的优化本质是内存复用 + 流水线重叠 + 指令集利用"**。
+- 一句话总结：**GEMM 的优化通常围绕内存复用、流水线重叠和目标指令利用展开**。
 
 ## 5.10 Checkpoint
 
@@ -280,7 +288,7 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 4. 以表格记录 latency、TFLOPS、shared memory/寄存器线索和生成代码观察；
 5. 解释为什么某个配置更快，不能只写“autotune 选中了它”。
 
-## 面试考点（本章相关）
+## 口述自测（详答见第 10 章）
 
 1. **口述分块 GEMM 的数据流**（global→shared→fragment→global，K 维流水线）。
 2. **为什么 TileLang 能 20 行写完 CUDA 要 200 行的 GEMM？**（布局推断 + 流水线自动注入 + T.gemm 直通 Tensor Core）。

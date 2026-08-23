@@ -1,7 +1,7 @@
 # 第 12 章 Cheatsheet 速查表
 
-> 面试前 30 分钟 / 写内核时随手翻的一页式参考。这里收录常用 API；
-> 硬件数字为**近似值**，型号不同会有出入，面试时说明"我记得大概是"。
+> 这是“查表”，不是“学习顺序”。适合已经完成主线后快速确认 API、公式、排错入口和
+> 报告字段；遇到概念不清，应回到第 01～09 章，而不是只看这里的单行结论。
 
 > 这是查表，不是跨版本 API 契约。`TMA`、warpgroup、TMEM、执行后端、autotune
 > 持久化和部分 layout helper 可能随 TileLang 版本/目标架构变化；复制前先查
@@ -22,7 +22,8 @@ def add(N: int, block: int = 256, dtype: str = 'float32'):
         with T.Kernel(T.ceildiv(N, block), threads=block) as bx:
             for i in T.Parallel(block):
                 gi = bx * block + i
-                C[gi] = A[gi] + B[gi]
+                if gi < N:
+                    C[gi] = A[gi] + B[gi]
     return kern
 # kernel = add(1 << 20); kernel(A, B, C); kernel.get_profiler().do_bench()
 ```
@@ -170,8 +171,8 @@ with set_autotune_inputs(A, B, C):
 | FP8 | `'float8_e4m3fn'`、`'float8_e5m2'` 等 | 依目标 GPU、编译器和 PyTorch 支持；不要直接承诺吞吐翻倍 |
 | 向量 | `'float32x4'` 等 x2/x4/x8/... | SIMD pack |
 
-指定方式三种等价：字符串 / `T.float32` / `torch.float32`。
-**铁律：fp16/bf16 输入 + fp32 累加。**
+指定方式通常可使用字符串、`T.float32` 或框架 dtype，但可接受范围仍以当前版本和后端
+为准。常见 GEMM 做法是 fp16/bf16 输入、fp32 累加；这不是所有算子和 dtype 的硬性规则。
 
 ## 5. 环境变量速查
 
@@ -185,7 +186,7 @@ with set_autotune_inputs(A, B, C):
 | `TILELANG_AUTO_TUNING_CPU_COUNTS` 等 | autotune 并行度控制 |
 | `TVM_ROOT` / `WITH_PIP_CUDA_TOOLCHAIN` | 构建期 |
 
-## 6. GPU 硬件常数参考（近似值，随型号变化）
+## 6. GPU 硬件常数参考（仅作查找入口，随型号变化）
 
 | 项目 | A100 | H100 SXM | RTX 4090 |
 |---|---|---|---|
@@ -197,7 +198,7 @@ with set_autotune_inputs(A, B, C):
 | SM bank 数 | 32（4B/bank） | 32 | 32 |
 | 最大线程/block | 1024 | 1024 | 1024 |
 
-> 面试说"近似、以官方规格为准"即可；重点是用它们做**理论峰值对比**。
+> 表格中的数字只用于提醒你需要查目标 GPU 的官方规格；不要直接用它们验收本地性能。
 
 ## 7. 常见报错与解决
 

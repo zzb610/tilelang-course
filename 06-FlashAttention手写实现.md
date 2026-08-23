@@ -1,8 +1,8 @@
 # 第 06 章 FlashAttention 手写实现
 
-> **本章目标**：从数学到代码完整实现 FlashAttention 前向（在线 softmax + 分块），
-> 并讲清它如何避免完整 N² 中间张量的 HBM 往返。这是大模型
-> 内核面试的"压轴题"，本章内容要能**脱稿推导 + 脱稿写码**。
+> **本章目标**：先从朴素 Attention 的存储问题出发，推导在线 softmax，再把公式映射到
+> 两个 tile GEMM 和一个分块循环。学习重点是“为什么这样更新仍然等价”，而不是先背
+> 一份长代码；代码验证通过后，再讨论 IO、反向重计算和变体。
 
 **学习信息**
 
@@ -11,6 +11,10 @@
 - 运行范围：完整前向示例需要支持 `T.gemm`/fragment 的 GPU；先用小尺寸做正确性，不要直接运行大尺寸参考实现；
 - 本章产出：online softmax 推导、一份小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。
 - 参考：[TileLang examples](https://github.com/tile-ai/tilelang/tree/main/examples)、[CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
+
+**阅读路线：**先把 `S → P → O` 的数据形状写清楚；再只学习 `(m, l, O)` 三个在线状态；
+随后逐段阅读实现；最后分开做“整除尺寸正确性”和“尾部尺寸设计”。不要把 dense reference
+能否运行、kernel 是否正确、kernel 是否高效混成一个问题。
 
 ## 6.1 朴素 Attention 为什么慢
 
@@ -32,9 +36,8 @@ O = P @ V                  # [B,H,N,d]
 完整 S/P 落盘。它不是把所有 Attention 的 HBM IO 变成 O(N)；更准确的 IO 上界依赖
 片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
 
-面试点：**FlashAttention 的核心贡献是减少 HBM 往返和 N² 中间张量**。是否从
-memory-bound 更接近 compute-bound，要由序列长度、head_dim、GPU、实现和 profiler
-结果判断。
+核心结论是：FlashAttention 减少了 HBM 往返，并避免把完整的 `S/P` 中间矩阵落盘；它
+是否更快、是否受访存限制，仍取决于序列长度、head_dim、GPU、实现和 profiler 结果。
 
 ## 6.2 在线 softmax：数学推导（必会）
 
@@ -87,12 +90,14 @@ for i, j in T.Parallel(block_M, dim):
 ```
 
 > 细节：`scale = (1/√d)·log2(e)`，配合 `T.exp2` 把 `/√d` 和 `exp` 都变成
-> `exp2(x·scale)` 一次搞定——少一次除法、少一次乘，还更稳定。这是个值得在面试
-> 里主动提起的实现细节。
+> `exp2(x·scale)` 一次计算——把缩放和指数变换放到同一表达式中。它是一个值得通过
+> 生成代码和数值测试确认的实现细节，不应脱离目标后端夸大收益。
 
 ## 6.3 TileLang 实现：完整代码
 
-以下代码精简自官方示例（去掉 autotune 装饰器，便于学习；`@tilelang.jit` 保留）：
+以下代码精简自官方示例（去掉 autotune 装饰器，便于学习；`@tilelang.jit` 保留）。为了
+让主线先聚焦算法，代码先以整除 tile 的小尺寸为验证目标；尾部 query/KV tile 的 guard、
+padding 和输出写回需要在通过主线后单独补齐。
 
 ```python
 import torch
@@ -200,7 +205,7 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
     return main
 ```
 
-### 6.3.1 逐段解读（面试可背诵版）
+### 6.3.1 逐段解读
 
 | 片段 | 作用 | 关键点 |
 |---|---|---|
@@ -215,7 +220,7 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 ### 6.3.2 运行与验证
 
 ```python
-# 先用小尺寸做正确性；N=4096 的 dense reference 会显式创建 N×N scores，可能占用大量显存。
+# 先用整除 tile 的小尺寸做正确性；dense reference 会显式创建 N×N scores，不能任意放大 N。
 B, H, N, D = 1, 2, 256, 64
 Q = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
 K = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
@@ -244,8 +249,7 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 `example_mha_bwd_bshd.py` 等）：**反向时用同样的分块循环重算 S/P**（用保存的
 `logsum` 或 `lse`），再算 `dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于
 实现和融合方式，换来 O(N²) 中间张量的显存节省与更少的 HBM 往返——在长序列上通常值得。
-面试答"为什么反向也快"
-时，说清楚这个权衡即可。
+解释反向时，应同时说明重计算、显存占用和实际运行时间之间的权衡。
 
 ## 6.5 变体速览（了解即可）
 
@@ -267,11 +271,12 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 ## 6.7 Checkpoint
 
 1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
-2. 对 `N=17`、`D=32` 分别验证 causal 和 non-causal，小尺寸先通过再扩大；
+2. 以 `N=17`、`D=32` 为边界设计题：列出 Q/K/V tile 的 padding、mask 和输出 guard，
+   再把这些处理补进代码后验证 causal 和 non-causal；
 3. 解释为什么 masked logits 要使用 `clear_accum=False` 保留 `-inf` 的语义；
 4. 写清 dense reference 为什么不能用于任意大序列的默认测试，并记录你的显存预算。
 
-## 面试考点（本章相关）
+## 口述自测（详答见第 10 章）
 
 1. **默写在线 softmax 三公式并解释每项**（尤其 rescaling 因子）。
 2. **FA 的 IO 复杂度推导与"为什么 memory-bound"**（O(N²)→O(N²·d²/M)）。
