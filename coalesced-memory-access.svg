@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900">
+  <defs>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f9e44"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#e03131"/>
+    </marker>
+    <style>
+      .title { font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2937; }
+      .subtitle { font: 400 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .heading { font: 700 24px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { font: 400 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #343a40; }
+      .small { font: 400 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #495057; }
+      .thread { font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .memory { font: 600 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .result { font: 600 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; fill: #2b8a3e; }
+      .result-bad { font: 600 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; fill: #c92a2a; }
+      .note { font: 400 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; fill: #7f6000; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="900" fill="#ffffff"/>
+  <text x="60" y="55" class="title">Coalesced Memory Access（合并访存）</text>
+  <text x="60" y="98" class="subtitle">同一个 warp 中的线程，是否访问连续、对齐且集中的地址？</text>
+
+  <rect x="50" y="135" width="630" height="585" rx="12" fill="#ebfbee" stroke="#2f9e44" stroke-width="3"/>
+  <rect x="720" y="135" width="630" height="585" rx="12" fill="#fff5f5" stroke="#e03131" stroke-width="3"/>
+
+  <text x="80" y="178" class="heading" fill="#2b8a3e">✓ 合并访存：连续访问</text>
+  <text x="750" y="178" class="heading" fill="#c92a2a">✗ 未合并：跨步访问</text>
+  <text x="80" y="222" class="body">线程 t0…t7 访问 A[0]…A[7]</text>
+  <text x="750" y="222" class="body">线程 t0…t7 访问 A[0], A[8], A[16]…</text>
+  <text x="80" y="270" class="small">同一个 warp 的线程</text>
+  <text x="750" y="270" class="small">同一个 warp 的线程</text>
+
+  <g id="good-thread">
+    <rect width="58" height="42" rx="5" fill="#b2f2bb" stroke="#2f9e44" stroke-width="2"/>
+  </g>
+  <g id="bad-thread">
+    <rect width="58" height="42" rx="5" fill="#e5dbff" stroke="#862e9c" stroke-width="2"/>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="600" text-anchor="middle" dominant-baseline="middle">
+    <use href="#good-thread" x="80" y="292"/><text x="109" y="313" fill="#1b4332">t0</text>
+    <use href="#good-thread" x="145" y="292"/><text x="174" y="313" fill="#1b4332">t1</text>
+    <use href="#good-thread" x="210" y="292"/><text x="239" y="313" fill="#1b4332">t2</text>
+    <use href="#good-thread" x="275" y="292"/><text x="304" y="313" fill="#1b4332">t3</text>
+    <use href="#good-thread" x="340" y="292"/><text x="369" y="313" fill="#1b4332">t4</text>
+    <use href="#good-thread" x="405" y="292"/><text x="434" y="313" fill="#1b4332">t5</text>
+    <use href="#good-thread" x="470" y="292"/><text x="499" y="313" fill="#1b4332">t6</text>
+    <use href="#good-thread" x="535" y="292"/><text x="564" y="313" fill="#1b4332">t7</text>
+    <use href="#bad-thread" x="750" y="292"/><text x="779" y="313" fill="#5f3b75">t0</text>
+    <use href="#bad-thread" x="815" y="292"/><text x="844" y="313" fill="#5f3b75">t1</text>
+    <use href="#bad-thread" x="880" y="292"/><text x="909" y="313" fill="#5f3b75">t2</text>
+    <use href="#bad-thread" x="945" y="292"/><text x="974" y="313" fill="#5f3b75">t3</text>
+    <use href="#bad-thread" x="1010" y="292"/><text x="1039" y="313" fill="#5f3b75">t4</text>
+    <use href="#bad-thread" x="1075" y="292"/><text x="1104" y="313" fill="#5f3b75">t5</text>
+    <use href="#bad-thread" x="1140" y="292"/><text x="1169" y="313" fill="#5f3b75">t6</text>
+    <use href="#bad-thread" x="1205" y="292"/><text x="1234" y="313" fill="#5f3b75">t7</text>
+  </g>
+
+  <text x="80" y="365" class="small">连续的 global memory 地址</text>
+  <text x="750" y="365" class="small">分散在不同 memory segment</text>
+
+  <rect x="80" y="400" width="540" height="92" rx="8" fill="#d0ebff" stroke="#1971c2" stroke-width="2"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="#1864ab">
+    <rect x="95" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="126" y="447">A[0]</text>
+    <rect x="160" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="191" y="447">A[1]</text>
+    <rect x="225" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="256" y="447">A[2]</text>
+    <rect x="290" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="321" y="447">A[3]</text>
+    <rect x="355" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="386" y="447">A[4]</text>
+    <rect x="420" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="451" y="447">A[5]</text>
+    <rect x="485" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="516" y="447">A[6]</text>
+    <rect x="550" y="425" width="62" height="42" fill="#a5d8ff" stroke="#1971c2"/><text x="581" y="447">A[7]</text>
+  </g>
+
+  <g stroke="#2f9e44" stroke-width="2" marker-end="url(#arrow-green)">
+    <line x1="109" y1="334" x2="126" y2="420"/><line x1="174" y1="334" x2="191" y2="420"/>
+    <line x1="239" y1="334" x2="256" y2="420"/><line x1="304" y1="334" x2="321" y2="420"/>
+    <line x1="369" y1="334" x2="386" y2="420"/><line x1="434" y1="334" x2="451" y2="420"/>
+    <line x1="499" y1="334" x2="516" y2="420"/><line x1="564" y1="334" x2="581" y2="420"/>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="600" text-anchor="middle" dominant-baseline="middle">
+    <rect x="750" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="779" y="447" fill="#d9480f">A[0]</text>
+    <rect x="815" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="844" y="447" fill="#d9480f">A[8]</text>
+    <rect x="880" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="909" y="447" fill="#d9480f">A[16]</text>
+    <rect x="945" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="974" y="447" fill="#d9480f">A[24]</text>
+    <rect x="1010" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="1039" y="447" fill="#d9480f">A[32]</text>
+    <rect x="1075" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="1104" y="447" fill="#d9480f">A[40]</text>
+    <rect x="1140" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="1169" y="447" fill="#d9480f">A[48]</text>
+    <rect x="1205" y="400" width="58" height="92" rx="5" fill="#ffe8cc" stroke="#f08c46" stroke-width="2"/><text x="1234" y="447" fill="#d9480f">A[56]</text>
+  </g>
+  <g stroke="#e03131" stroke-width="2" marker-end="url(#arrow-red)">
+    <line x1="779" y1="334" x2="779" y2="394"/><line x1="844" y1="334" x2="844" y2="394"/>
+    <line x1="909" y1="334" x2="909" y2="394"/><line x1="974" y1="334" x2="974" y2="394"/>
+    <line x1="1039" y1="334" x2="1039" y2="394"/><line x1="1104" y1="334" x2="1104" y2="394"/>
+    <line x1="1169" y1="334" x2="1169" y2="394"/><line x1="1234" y1="334" x2="1234" y2="394"/>
+  </g>
+
+  <rect x="80" y="535" width="540" height="92" rx="8" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+  <text x="350" y="570" class="result">访问集中在同一个 segment</text>
+  <text x="350" y="600" class="result">≈ 少量 memory transactions</text>
+  <rect x="750" y="535" width="540" height="92" rx="8" fill="#ffe3e3" stroke="#e03131" stroke-width="2"/>
+  <text x="1020" y="570" class="result-bad">访问分散到多个 segment</text>
+  <text x="1020" y="600" class="result-bad">≈ 更多 memory transactions</text>
+
+  <rect x="50" y="760" width="1300" height="90" rx="10" fill="#fff3bf" stroke="#d39e00" stroke-width="2"/>
+  <text x="700" y="797" class="note">判断合并访存：同一 warp 的地址是否连续、对齐、集中。</text>
+  <text x="700" y="827" class="note" font-size="17">实际事务数还取决于硬件、访问宽度、对齐方式和活跃线程。</text>
+</svg>

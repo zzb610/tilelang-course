@@ -1,5 +1,9 @@
-"""macOS (Apple Silicon / Metal) 后端验证通过的示例
+"""TileLang 的基础 smoke test。
+
 运行: .venv/bin/python examples/metal_verify.py
+
+脚本优先使用 CUDA，其次使用 Apple MPS。没有可用 GPU 时会打印环境提示并正常退出；
+这让它适合放进新环境的第一轮检查，而不是把“没有设备”误报成内核错误。
 
 注意（2026-08，tilelang 0.1.13 macOS arm64 wheel）：
 - T.Parallel / T.copy / alloc_shared / 串行归约（threads<=32）在 Metal 上验证可用；
@@ -58,9 +62,15 @@ def vector_add(N: int, block: int = 256, dtype: str = 'float32'):
 
 
 if __name__ == "__main__":
-    # GPU/CUDA 标准写法：dev = "cuda"（张量 device='cuda'）
-    # Mac/Metal 使用 MPS：
-    dev = "mps:0"
+    if torch.cuda.is_available():
+        # NVIDIA GPU：课程主路径
+        dev = "cuda"
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        # Apple Silicon：基础语法/有限后端 smoke test
+        dev = "mps"
+    else:
+        print("SKIP: 没有可用的 CUDA 或 MPS 设备；请在 GPU 环境运行本 smoke test。")
+        raise SystemExit(0)
 
     N = 1 << 20
     a = torch.randn(N, device=dev)
@@ -74,7 +84,7 @@ if __name__ == "__main__":
     N = 256
     A = torch.randn(N, N, device=dev)
     O = torch.empty(N, N, device=dev)
-    # GPU/CUDA 标准写法：softmax_rows(N, threads=128)
+    # GPU/CUDA 标准写法可以使用 128/256 个线程；32 对 Metal 兼容性更保守。
     k2 = softmax_rows(N, threads=32)   # Metal 兼容：threads<=32
     k2(A, O)
     torch.testing.assert_close(O, torch.softmax(A, dim=-1), rtol=1e-4, atol=1e-6)

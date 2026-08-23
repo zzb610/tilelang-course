@@ -4,18 +4,25 @@
 > swizzle → 自动调优」全流程，并用 profiler 量化每一步的收益。GEMM 是 GPU 内核
 > 面试的"hello world"，本章结束后你要能**闭着眼画出它的数据流并口述优化顺序**。
 
+**学习信息**
+
+- 难度：中高级；预计用时：5–8 小时；
+- 前置：第 01～04 章，理解 shared、fragment、pipeline 和边界处理；
+- 运行范围：完整版本需要支持 `T.gemm` 的目标 GPU；本章性能数字只在记录的硬件/版本上成立；
+- 本章产出：一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表和一份 TFLOPS 报告。
+- 参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、[TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
+
 ## 5.1 问题与理论峰值
 
 计算 `C[M,N] = A[M,K] × B[K,N]`（行主序）。
 
 - 计算量：`2·M·N·K` FLOPs；
-- 理论峰值（示例，近似值）：A100 fp16 tensor core ≈ 312 TFLOPS（含 sparsity 翻倍），
-  H100 ≈ 990 TFLOPS，RTX 4090 ≈ 330 TFLOPS；HBM 带宽 A100 ≈ 2 TB/s，H100 ≈ 3.35 TB/s；
+- 理论峰值取决于 GPU 型号、dtype、稀疏模式、时钟和库路径；请把目标 GPU 的官方规格
+  填入实验记录，不要把某张卡的数字当作课程常数；
 - 目标不是"跑得快"，是**逼近硬件峰值的前提下找证据**（面试官最恨"我感觉很快"）。
 
-衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。官方基准：调优后的 TileLang
-GEMM 在 4090 上约为 cuBLAS 的 1.1 倍、A100 上 ~0.97 倍、H100 上 ~1.0 倍（官方
-matmul.md 数据，可作为面试谈资）。
+衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。与 cuBLAS/torch 的比较必须
+使用相同输入、dtype、warmup、rep 和同步方式；不要把历史 benchmark 数字直接套到自己的机器。
 
 ## 5.2 版本 0：不碰共享内存（教学用）
 
@@ -46,14 +53,15 @@ def gemm_naive(M: int, N: int, K: int, BM: int = 64, BN: int = 64,
     return kern
 ```
 
-**为什么慢**：每个输出元素每步都要从 HBM 读 `A[i,k]` 和 `B[k,j]`，没有复用 → 访存
-量 O(MNK) → 被显存带宽死死摁住。多数新手的第一版 GEMM 都死在这。它是对的，但
-不是性能起点。
+**为什么慢**：每个输出元素每步都要从 global memory 读 `A[i,k]` 和 `B[k,j]`，复用
+很差 → 访存量接近 O(MNK)。这是用于建立对照的教学基线；先用小尺寸验证它，再进入
+shared/GEMM 路径，不要把它当作生产实现。
 
 ## 5.3 版本 1：分块 + 共享内存 + 流水线（官方标准骨架）
 
 核心改动：K 维切成 `BK` 的块；每轮的 `A/B` tile 先 `T.copy` 进共享内存，再用
-`T.gemm` 一句完成 tile 级矩阵乘（编译器把它翻译成 Tensor Core 指令，如 `mma`）。
+`T.gemm` 一句完成 tile 级矩阵乘。具体会落到哪类 Tensor Core/后端指令由目标 GPU、
+dtype 和 TileLang 版本决定，必须用生成源码确认。
 
 ```python
 @jit
@@ -112,31 +120,44 @@ print(f"latency={lat:.3f} ms, {2*M*N*K/lat/1e6:.1f} TFLOPS")
 
 ## 5.4 版本 2：处理任意尺寸（边界/残差）
 
-M、N、K 不整除时，`T.copy` 与 `T.gemm` 都会被自动保护，但最好**先把全局 tile
-范围写对**。两种方案：
+M、N、K 不整除时，要分别处理三件事：
 
-- **方案 A（软件边界）**：拷贝时用 `T.min` 截断范围，计算时用 predicate 掩码——
-  对 GEMM 通常先做 `T.copy` 然后让 auto-safe pass 处理，多数官方示例依赖自动
-  保护，仅在 epilogue 写回前判断：
-- **方案 B（pad 到整数倍）**：主机侧把 A/B 零填充（或拷贝时 `if` 保护）。性能最好，
-  工程上常用。
+1. grid 用 `ceildiv` 覆盖尾部输出 tile；
+2. epilogue 只写 `M×N` 有效区域；
+3. K 维尾部 tile 必须写入确定的 0，不能因为 safe-access 跳过写入就把 shared 中的旧值
+   当成 padding。`T.clear(C_f)` 只能清累加器，不能清 `A_s/B_s`。
+
+教学阶段推荐“显式 guarded copy”；工程阶段也可以在 host 侧把 A/B pad 到 tile 整数倍，
+再用无分支的主 kernel。下面是 guarded copy 的核心形状（完整代码中保留其余 v1 结构）：
 
 ```python
-    with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=threads) as (bx, by):
-        ...
-        for ko in T.Pipelined(T.ceildiv(K, BK), num_stages=num_stages):
-            # 用 T.min 限制范围，避免读越界（自动安全 pass 也会兜底）
-            T.copy(A[by * BM, ko * BK], A_s)
-            T.copy(B[ko * BK, bx * BN], B_s)
-            T.gemm(A_s, B_s, C_f)
-        for i, j in T.Parallel(BM, BN):
-            if T.all_of(by * BM + i < M, bx * BN + j < N):
-                C[by * BM + i, bx * BN + j] = C_f[i, j]   # 只写合法区域
+for i, k in T.Parallel(BM, BK):
+    gi = by * BM + i
+    gk = ko * BK + k
+    if T.all_of(gi < M, gk < K):
+        A_s[i, k] = A[gi, gk]
+    else:
+        A_s[i, k] = 0
+
+for k, j in T.Parallel(BK, BN):
+    gk = ko * BK + k
+    gj = bx * BN + j
+    if T.all_of(gk < K, gj < N):
+        B_s[k, j] = B[gk, gj]
+    else:
+        B_s[k, j] = 0
+
+T.gemm(A_s, B_s, C_f)
+
+for i, j in T.Parallel(BM, BN):
+    gi, gj = by * BM + i, bx * BN + j
+    if T.all_of(gi < M, gj < N):
+        C[gi, gj] = C_f[i, j]
 ```
 
-（更稳的工程做法：K 维也按 `T.ceildiv(K, BK)` 迭代，越界 tile 由
-`LegalizeSafeMemoryAccess` 自动屏蔽，前提是**累加器初始值正确**——`T.clear` 保证
-整块清零，即使某些 k 是垃圾数据也不影响测试。面试时把这两个坑说清楚很加分。）
+> 这里的关键不是“写了几个 if”，而是把每一个可能的无效元素定义成 0，并单独保护
+> 输出。不同版本的 safe-access pass 可能自动插入 guard，但不会替你推断 GEMM padding
+> 的数值语义。先用 `M=1003, N=517, K=70` 这类尺寸做正确性测试，再测大尺寸。
 
 ## 5.5 版本 3：布局与光栅化（swizzle）
 
@@ -157,6 +178,7 @@ def gemm_v3(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
         C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=threads) as (bx, by):
+            T.use_swizzle(panel_size=10, enable=rasterize)
             A_s = T.alloc_shared((BM, BK), dtype)
             B_s = T.alloc_shared((BK, BN), dtype)
             C_f = T.alloc_fragment((BM, BN), accum_dtype)
@@ -182,9 +204,9 @@ def gemm_v3(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
 命中率。放在 `T.Kernel` 上下文里即可：
 
 ```python
-    with T.Kernel(...) as (bx, by):
-        T.use_swizzle(panel_size=10, enable=True)   # 可选：光栅化调度
-        ...
+with T.Kernel(...) as (bx, by):
+    T.use_swizzle(panel_size=10, enable=True)   # 可选：光栅化调度
+    # 其余 tile 计算省略
 ```
 
 交互实验建议：`swizzle=True/False`、`rasterize=True/False`、`num_stages=2/3/4`、
@@ -200,7 +222,7 @@ def gemm_v4(M: int, N: int, K: int, block_M: int = 128, block_N: int = 128,
             block_K: int = 32, threads: int = 128, num_stages: int = 3,
             dtype: str = 'float16', accum_dtype: str = 'float32'):
     @T.prim_func
-    def kern(...):
+    def kern(A, B, C):
         ...   # 与 v1 相同的主体内核
     return kern
 ```
@@ -249,6 +271,14 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
   用 TFLOPS 验证。
 - `T.gemm` 是 tile 级原语：内部完成布局分发与 Tensor Core 指令选择。
 - 面试黄金句：**"GEMM 的优化本质是内存复用 + 流水线重叠 + 指令集利用"**。
+
+## 5.10 Checkpoint
+
+1. 先只运行 v0 和 v1，给出正确性结果和延迟；
+2. 用一个 M/N/K 都不整除的尺寸验证 guarded copy 或 host padding；
+3. 每次只打开一个开关：`num_stages`、布局 swizzle、rasterization、tile 尺寸；
+4. 以表格记录 latency、TFLOPS、shared memory/寄存器线索和生成代码观察；
+5. 解释为什么某个配置更快，不能只写“autotune 选中了它”。
 
 ## 面试考点（本章相关）
 

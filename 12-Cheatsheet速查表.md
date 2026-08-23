@@ -1,7 +1,11 @@
 # 第 12 章 Cheatsheet 速查表
 
-> 面试前 30 分钟 / 写内核时随手翻的一页式参考。所有 API 与官方文档一致；
+> 面试前 30 分钟 / 写内核时随手翻的一页式参考。这里收录常用 API；
 > 硬件数字为**近似值**，型号不同会有出入，面试时说明"我记得大概是"。
+
+> 这是查表，不是跨版本 API 契约。`TMA`、warpgroup、TMEM、执行后端、autotune
+> 持久化和部分 layout helper 可能随 TileLang 版本/目标架构变化；复制前先查
+> `resources.md` 和当前官方 examples。
 
 ## 0. 标准开头与最小模板
 
@@ -33,7 +37,7 @@ def add(N: int, block: int = 256, dtype: str = 'float32'):
 | `with T.Kernel(gx, gy, gz, threads=t) as (bx,by,bz)` | grid/block 配置 | bx↔blockIdx.x；线程映射自动 |
 | `T.serial(a, b, s)` | 顺序循环 | 有依赖/归约用 |
 | `T.unroll(n)` | 展开 | 小循环 |
-| `T.Parallel(e0, e1, ...)` | 并行循环 | elementwise/拷贝；自动向量化 |
+| `T.Parallel(e0, e1, ...)` | 并行循环 | elementwise/拷贝；给编译器并行化/向量化机会 |
 | `T.Pipelined(n, num_stages=k)` | 软件流水线 | GEMM/FA 主循环标配 |
 | `T.Persistent(...)` | 持久化 block | 高级模板 |
 | `T.while` / `break` / `continue` | 控制流 | 条件须为 TIR 表达式 |
@@ -55,7 +59,7 @@ def add(N: int, block: int = 256, dtype: str = 'float32'):
 | API | 说明 |
 |---|---|
 | `T.copy(src, dst, coalesced_width=None, disable_tma=False, eviction_policy=None, loop_layout=None)` | 同步语义；自动合并/向量化/选择机制 |
-| `T.async_copy(src, dst)` | cp.async 显式异步；**必须手动 `T.ptx_wait_group`** |
+| `T.async_copy(src, dst)` | 显式异步；消费前按目标版本确认 wait/sync |
 | `T.tma_copy(src, dst)` | cp.async.bulk（TMA） |
 | `T.transpose(src, dst)` | 共享内存转置 |
 | `T.c2d_im2col(img, col, ...)` | 卷积 im2col |
@@ -146,7 +150,8 @@ p.assert_allclose(ref_fn, rtol=1e-2, atol=1e-2)                # 校验
 def matmul(M, N, K, block_M=128, block_N=128, block_K=32,
            threads=128, num_stages=3, dtype='float16', accum_dtype='float32'):
     @T.prim_func
-    def kern(...): ...
+    def kern(A, B, C):
+        ...
     return kern
 
 from tilelang.autotuner import set_autotune_inputs
@@ -162,7 +167,7 @@ with set_autotune_inputs(A, B, C):
 | BF16 | `'bfloat16'` | 范围同 fp32，尾数 8 位 |
 | 单/双 | `'float32'` / `'float64'` | 累加常用 fp32 |
 | 整型 | `'int8/16/32/64'`、`'uint*'` | |
-| FP8 | `'float8_e4m3fn'`、`'float8_e5m2'`、`'float8_e4m3b11fnuz'` 等 | H100 翻倍吞吐；需 torch≥2.1 |
+| FP8 | `'float8_e4m3fn'`、`'float8_e5m2'` 等 | 依目标 GPU、编译器和 PyTorch 支持；不要直接承诺吞吐翻倍 |
 | 向量 | `'float32x4'` 等 x2/x4/x8/... | SIMD pack |
 
 指定方式三种等价：字符串 / `T.float32` / `torch.float32`。
@@ -201,7 +206,7 @@ with set_autotune_inputs(A, B, C):
 | `Ramp of more than 4 lanes is not allowed` | 向量化宽度过宽（8 lane）；检查 T.copy/T.Parallel 的宽度提示或改布局 |
 | shared memory 超限 | tile×stages 太大；降 BK/stages 或 tile |
 | `T.gemm` 布局不匹配报错 | A_s/B_s/C_f 布局冲突；`annotate_layout` 显式指定 |
-| 结果错在边界 tile | 越界读写；依赖自动保护或显式 `T.all_of` guard |
+| 结果错在边界 tile | 越界读写或尾部 tile 未零填充；输出用 guard，GEMM 输入明确 padding |
 | `async_copy` 结果错 | 忘了 `T.ptx_wait_group`；或屏障时机不对 |
 | autotune "No configurations" | configs 为空/过滤过头；检查生成器 |
 | 动态形状 autotune 报错 | 内置生成器需静态形状；改用 `set_autotune_inputs` |

@@ -1,8 +1,16 @@
 # 第 06 章 FlashAttention 手写实现
 
 > **本章目标**：从数学到代码完整实现 FlashAttention 前向（在线 softmax + 分块），
-> 并讲清为什么它把 Attention 的 IO 复杂度从 O(N²) 降到接近 O(N)。这是大模型
+> 并讲清它如何避免完整 N² 中间张量的 HBM 往返。这是大模型
 > 内核面试的"压轴题"，本章内容要能**脱稿推导 + 脱稿写码**。
+
+**学习信息**
+
+- 难度：高级；预计用时：5–8 小时；
+- 前置：第 03～05 章，理解分块 GEMM、归约、mask 和 fp16/fp32 混合精度；
+- 运行范围：完整前向示例需要支持 `T.gemm`/fragment 的 GPU；先用小尺寸做正确性，不要直接运行大尺寸参考实现；
+- 本章产出：online softmax 推导、一份小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。
+- 参考：[TileLang examples](https://github.com/tile-ai/tilelang/tree/main/examples)、[CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
 
 ## 6.1 朴素 Attention 为什么慢
 
@@ -14,18 +22,19 @@ O = P @ V                  # [B,H,N,d]
 
 两个致命问题：
 
-1. **显存爆炸**：`S` 和 `P` 都是 `N×N`，序列 32K 时单头就是 1.1GB（fp16 bf16），
-   多卡训练根本放不下；
+1. **显存爆炸**：`S` 和 `P` 都是 `N×N`，序列 32K 时单头仅一个 fp16 中间张量就约
+   2 GiB；多头/多 batch 更快放大；
 2. **IO 浪费**：softmax 的归一化分母需要看到整行，所以 `Q@K^T` 的结果必须先写回
    HBM，`P@V` 时再读回来——**同一份中间数据被存取两遍**。
 
-总 HBM 访存 O(N²)，而计算只有 O(N²·d)。当 d=128 时，理想实现应该把 N² 的中间
-张量永远留在片上。FlashAttention 的解法：**分块 + 在线 softmax**——把 N 维切成
-块，在寄存器里滚动维护"部分归一化"，绝不落盘 S/P。
+朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量是 O(N²·d)。FlashAttention
+的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护“部分归一化”，不把
+完整 S/P 落盘。它不是把所有 Attention 的 HBM IO 变成 O(N)；更准确的 IO 上界依赖
+片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
 
-面试点：**FlashAttention 的核心贡献是 IO 复杂度**：从 O(N²) HBM 访存降到
-O(N²·d²/M)（M 为片上内存），实际训练/推理里 Attention 从 memory-bound 变成了
-接近 compute-bound。论文标题里的 "Fast and Memory-Efficient" 各指其一。
+面试点：**FlashAttention 的核心贡献是减少 HBM 往返和 N² 中间张量**。是否从
+memory-bound 更接近 compute-bound，要由序列长度、head_dim、GPU、实现和 profiler
+结果判断。
 
 ## 6.2 在线 softmax：数学推导（必会）
 
@@ -157,7 +166,8 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 
                 # S 块 = Q_shared @ K_shared^T（转置 B）
                 T.gemm(Q_shared, K_shared, acc_s,
-                       transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                       transpose_B=True, clear_accum=False,
+                       policy=T.GemmWarpPolicy.FullRow)
 
                 # ---- 在线 softmax 更新（见 6.2）----
                 T.copy(scores_max, scores_max_prev)
@@ -205,7 +215,8 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 ### 6.3.2 运行与验证
 
 ```python
-B, H, N, D = 8, 32, 4096, 128
+# 先用小尺寸做正确性；N=4096 的 dense reference 会显式创建 N×N scores，可能占用大量显存。
+B, H, N, D = 1, 2, 256, 64
 Q = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
 K = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
 V = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
@@ -221,17 +232,19 @@ P = F.softmax(scores, dim=-1)
 ref = torch.einsum('bhqk,bkhd->bqhd', P, V)
 torch.testing.assert_close(O, ref, rtol=1e-2, atol=1e-2)
 
-total_flops = 4 * B * H * N * N * D      # QK^T + PV 两个 matmul（各 2·B·H·N²·D）
 lat = kernel.get_profiler().do_bench()
 print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
+
+# 性能实验时，再单独选择显存能承受的 N，并把 reference 与 kernel 的计时分开。
 ```
 
 ## 6.4 反向传播：为什么"重计算"
 
 反向需要 `P` 和 `S`，但前向从不落盘。FlashAttention 的做法（官方 bwd 示例
 `example_mha_bwd_bshd.py` 等）：**反向时用同样的分块循环重算 S/P**（用保存的
-`logsum` 或 `lse`），再算 `dV、dK、dQ`。代价是反向多一遍 QKᵀ/PV 计算（约 +33%
-FLOPs），换来 O(N²) 显存节省与 IO 减少——在长序列上稳赚。面试答"为什么反向也快"
+`logsum` 或 `lse`），再算 `dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于
+实现和融合方式，换来 O(N²) 中间张量的显存节省与更少的 HBM 往返——在长序列上通常值得。
+面试答"为什么反向也快"
 时，说清楚这个权衡即可。
 
 ## 6.5 变体速览（了解即可）
@@ -244,12 +257,19 @@ FLOPs），换来 O(N²) 显存节省与 IO 减少——在长序列上稳赚。
 
 ## 6.6 本章小结
 
-- 朴素 Attention 慢在 **O(N²) HBM 访存**（S/P 落盘两次）；FA 用**分块 + 在线
-  softmax** 把它留在片上，IO 复杂度降到近 O(N)。
+- 朴素 Attention 慢在 **N² 中间张量的 HBM 往返**；FA 用**分块 + 在线 softmax**
+  避免完整 S/P 落盘，实际 IO 仍取决于片上容量和 tile 设计。
 - 公式三件套：`m_new=max(m_old,m_local)`，`l_new=l_old·e^(m_old−m_new)+l_local·e^(m_local−m_new)`，`O_old *= e^(m_old−m_new)`。
 - TileLang 实现 = 2 个 `T.gemm`（QKᵀ、PV）+ fragment 里的 max/exp2/sum + 掩码，
   约 90 行。
 - 反向靠重计算；`exp2(x·scale)` 融合 `1/√d` 是值得炫耀的实现细节。
+
+## 6.7 Checkpoint
+
+1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
+2. 对 `N=17`、`D=32` 分别验证 causal 和 non-causal，小尺寸先通过再扩大；
+3. 解释为什么 masked logits 要使用 `clear_accum=False` 保留 `-inf` 的语义；
+4. 写清 dense reference 为什么不能用于任意大序列的默认测试，并记录你的显存预算。
 
 ## 面试考点（本章相关）
 
