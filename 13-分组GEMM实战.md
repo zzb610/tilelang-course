@@ -135,7 +135,7 @@ import torch
 
 def grouped_gemm_reference(A_pack, B_stack, row_offsets):
     """A_pack: [sum(M_g), K], B_stack: [G, K, N]."""
-    outputs = []
+    outputs = []  # 每个元素 shape: [M_g, N]
     group_count = B_stack.shape[0]
 
     for g in range(group_count):
@@ -144,8 +144,9 @@ def grouped_gemm_reference(A_pack, B_stack, row_offsets):
         outputs.append(A_pack[row_start:row_end] @ B_stack[g])
 
     if not outputs:
-        return A_pack.new_empty((0, B_stack.shape[-1]))
-    return torch.cat(outputs, dim=0)
+        return A_pack.new_empty((0, B_stack.shape[-1]))  # shape: [0, N]
+    result = torch.cat(outputs, dim=0)  # shape: [sum(M_g), N]
+    return result
 ```
 
 这里的 `row_offsets` 可以是 Python 列表，也可以是 CPU 上的整数 tensor。参考实现要明确三件事：
@@ -158,12 +159,13 @@ def grouped_gemm_reference(A_pack, B_stack, row_offsets):
 
 ```python
 def grouped_gemm_separate_launches(A_pack, B_stack, row_offsets):
-    outputs = []
+    outputs = []  # 每个元素 shape: [M_g, N]
     for g in range(B_stack.shape[0]):
         row_start = int(row_offsets[g])
         row_end = int(row_offsets[g + 1])
         outputs.append(A_pack[row_start:row_end] @ B_stack[g])
-    return torch.cat(outputs, dim=0)
+    result = torch.cat(outputs, dim=0)  # shape: [sum(M_g), N]
+    return result
 ```
 
 这个基线可以用来回答第一个性能问题：**把多个 GEMM 合成一个 grouped kernel，是否只是减少了 kernel launch？** 不一定。除了 launch 次数，还可能改变：
@@ -254,30 +256,30 @@ import torch
 
 
 def build_group_metadata(group_sizes, block_m, device="cuda"):
-    sizes = torch.as_tensor(group_sizes, dtype=torch.int32)
+    sizes = torch.as_tensor(group_sizes, dtype=torch.int32)  # shape: [G]
     group_count = sizes.numel()
 
-    row_offsets = torch.zeros(group_count + 1, dtype=torch.int32)
+    row_offsets = torch.zeros(group_count + 1, dtype=torch.int32)  # shape: [G+1]
     row_offsets[1:] = torch.cumsum(sizes, dim=0)
 
     # 空组不产生有效输出；这里给它 0 个工作块，避免无意义计算。
-    m_blocks = (sizes + block_m - 1) // block_m
-    padded_sizes = m_blocks * block_m
+    m_blocks = (sizes + block_m - 1) // block_m  # shape: [G]
+    padded_sizes = m_blocks * block_m              # shape: [G]
 
-    padded_offsets = torch.zeros(group_count + 1, dtype=torch.int32)
+    padded_offsets = torch.zeros(group_count + 1, dtype=torch.int32)  # shape: [G+1]
     padded_offsets[1:] = torch.cumsum(padded_sizes, dim=0)
 
-    group_ids = torch.arange(group_count, dtype=torch.int32)
-    group_idx_for_block = torch.repeat_interleave(group_ids, m_blocks)
+    group_ids = torch.arange(group_count, dtype=torch.int32)  # shape: [G]
+    group_idx_for_block = torch.repeat_interleave(group_ids, m_blocks)  # shape: [num_m_blocks]
     num_m_blocks = int(group_idx_for_block.numel())
     padded_total_m = int(padded_offsets[-1].item())
     total_m = int(row_offsets[-1].item())
 
     metadata = {
-        "group_sizes": sizes.to(device),
-        "row_offsets": row_offsets.to(device),
-        "padded_offsets": padded_offsets.to(device),
-        "group_idx_for_block": group_idx_for_block.to(device),
+        "group_sizes": sizes.to(device),                    # shape: [G]
+        "row_offsets": row_offsets.to(device),              # shape: [G+1]
+        "padded_offsets": padded_offsets.to(device),        # shape: [G+1]
+        "group_idx_for_block": group_idx_for_block.to(device),  # shape: [num_m_blocks]
     }
     return metadata, total_m, padded_total_m, num_m_blocks
 ```
@@ -537,10 +539,10 @@ import torch
 
 
 def check_group_metadata(group_sizes, row_offsets, padded_offsets, group_idx_for_block, block_m):
-    sizes = torch.as_tensor(group_sizes, dtype=torch.int32, device="cpu")
-    rows = torch.as_tensor(row_offsets, dtype=torch.int32, device="cpu")
-    padded = torch.as_tensor(padded_offsets, dtype=torch.int32, device="cpu")
-    block_groups = torch.as_tensor(group_idx_for_block, dtype=torch.int32, device="cpu")
+    sizes = torch.as_tensor(group_sizes, dtype=torch.int32, device="cpu")  # shape: [G]
+    rows = torch.as_tensor(row_offsets, dtype=torch.int32, device="cpu")   # shape: [G+1]
+    padded = torch.as_tensor(padded_offsets, dtype=torch.int32, device="cpu")  # shape: [G+1]
+    block_groups = torch.as_tensor(group_idx_for_block, dtype=torch.int32, device="cpu")  # shape: [num_m_blocks]
 
     assert rows[0].item() == 0
     assert padded[0].item() == 0

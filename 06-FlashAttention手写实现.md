@@ -112,33 +112,33 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
               block_M: int = 128, block_N: int = 128,
               num_stages: int = 1, threads: int = 128):
     scale = (1.0 / dim) ** 0.5 * 1.44269504      # 1/sqrt(d) * log2(e)
-    shape = [batch, seq_len, heads, dim]         # bshd 布局
+    shape = (batch, seq_len, heads, dim)         # Q/K/V/Output shape: [B, N, H, D]，bshd 布局
     dtype = 'float16'
     accum_dtype = 'float32'
 
     @T.prim_func
     def main(
-        Q: T.Tensor(shape, dtype),
-        K: T.Tensor(shape, dtype),
-        V: T.Tensor(shape, dtype),
-        Output: T.Tensor(shape, dtype),
+        Q: T.Tensor((batch, seq_len, heads, dim), dtype),      # shape: [B, N, H, D]
+        K: T.Tensor((batch, seq_len, heads, dim), dtype),      # shape: [B, N, H, D]
+        V: T.Tensor((batch, seq_len, heads, dim), dtype),      # shape: [B, N, H, D]
+        Output: T.Tensor((batch, seq_len, heads, dim), dtype), # shape: [B, N, H, D]
     ):
         # 网格：(seq/block_M, heads, batch)；一个 block 算一行 (block_M 个 query)
         with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch,
                       threads=threads) as (bx, by, bz):
-            Q_shared = T.alloc_shared([block_M, dim], dtype)
-            K_shared = T.alloc_shared([block_N, dim], dtype)
-            V_shared = T.alloc_shared([block_N, dim], dtype)
-            O_shared = T.alloc_shared([block_M, dim], dtype)
+            Q_shared = T.alloc_shared((block_M, dim), dtype)       # shape: [BM, D]
+            K_shared = T.alloc_shared((block_N, dim), dtype)       # shape: [BN, D]
+            V_shared = T.alloc_shared((block_N, dim), dtype)       # shape: [BN, D]
+            O_shared = T.alloc_shared((block_M, dim), dtype)       # shape: [BM, D]
 
-            acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)  # S 块
-            acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)   # 喂 GEMM 要 fp16
-            acc_o = T.alloc_fragment([block_M, dim], accum_dtype)      # P@V 累加
-            scores_max = T.alloc_fragment([block_M], accum_dtype)
-            scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
-            scores_scale = T.alloc_fragment([block_M], accum_dtype)
-            scores_sum = T.alloc_fragment([block_M], accum_dtype)
-            logsum = T.alloc_fragment([block_M], accum_dtype)
+            acc_s = T.alloc_fragment((block_M, block_N), accum_dtype)  # shape: [BM, BN]，S 块
+            acc_s_cast = T.alloc_fragment((block_M, block_N), dtype)   # shape: [BM, BN]，喂 GEMM 要 fp16
+            acc_o = T.alloc_fragment((block_M, dim), accum_dtype)      # shape: [BM, D]，P@V 累加
+            scores_max = T.alloc_fragment((block_M,), accum_dtype)     # shape: [BM]
+            scores_max_prev = T.alloc_fragment((block_M,), accum_dtype) # shape: [BM]
+            scores_scale = T.alloc_fragment((block_M,), accum_dtype)    # shape: [BM]
+            scores_sum = T.alloc_fragment((block_M,), accum_dtype)      # shape: [BM]
+            logsum = T.alloc_fragment((block_M,), accum_dtype)          # shape: [BM]
 
             # 把本 block 的 Q tile 一次拷进共享内存（复用 block_N 轮）
             T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
@@ -222,19 +222,19 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 ```python
 # 先用整除 tile 的小尺寸做正确性；dense reference 会显式创建 N×N scores，不能任意放大 N。
 B, H, N, D = 1, 2, 256, 64
-Q = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
-K = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
-V = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)
+Q = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)   # shape: [B, N, H, D]
+K = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)   # shape: [B, N, H, D]
+V = torch.randn(B, N, H, D, device='cuda', dtype=torch.float16)   # shape: [B, N, H, D]
 
 kernel = flashattn(B, H, N, D, is_causal=True)
-O = kernel(Q, K, V)                      # out_idx=[3]，返回输出
+O = kernel(Q, K, V)                      # shape: [B, N, H, D]；out_idx=[3]，返回输出
 
 # 参考实现（einsum + 因果掩码 + softmax）
-scores = torch.einsum('bqhd,bkhd->bhqk', Q, K) / (D ** 0.5)
-mask = torch.tril(torch.ones(N, N, device='cuda')).unsqueeze(0).unsqueeze(0)
-scores = scores.masked_fill(mask == 0, float('-inf'))
-P = F.softmax(scores, dim=-1)
-ref = torch.einsum('bhqk,bkhd->bqhd', P, V)
+scores = torch.einsum('bqhd,bkhd->bhqk', Q, K) / (D ** 0.5)  # shape: [B, H, N, N]
+mask = torch.tril(torch.ones(N, N, device='cuda')).unsqueeze(0).unsqueeze(0)  # shape: [1, 1, N, N]
+scores = scores.masked_fill(mask == 0, float('-inf'))       # shape: [B, H, N, N]
+P = F.softmax(scores, dim=-1)                               # shape: [B, H, N, N]
+ref = torch.einsum('bhqk,bkhd->bqhd', P, V)                 # shape: [B, N, H, D]
 torch.testing.assert_close(O, ref, rtol=1e-2, atol=1e-2)
 
 lat = kernel.get_profiler().do_bench()

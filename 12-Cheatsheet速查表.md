@@ -146,16 +146,20 @@ p.assert_allclose(ref_fn, rtol=1e-2, atol=1e-2)                # 校验
 ### Autotune 最小模板
 
 ```python
+# 速查模板：A/B/C 都是二维 tile GEMM 的输入输出，具体 shape 在 prim_func 中声明。
 @tilelang.autotune(configs=configs_fn, warmup=25, rep=100, timeout=60)
 @tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M=128, block_N=128, block_K=32,
            threads=128, num_stages=3, dtype='float16', accum_dtype='float32'):
+    # 这里是 autotune 外壳；真实 kernel 内应把 A/B/C 声明为 [M,K]/[K,N]/[M,N]。
     @T.prim_func
     def kern(A, B, C):
+        # A/B/C 的 shape 见上一行说明；此处省略 tiled GEMM 主体。
         ...
     return kern
 
 from tilelang.autotuner import set_autotune_inputs
+# A=[M,K]、B=[K,N]、C=[M,N]；所有候选使用同一批输入。
 with set_autotune_inputs(A, B, C):
     best = matmul(M, N, K)
 ```

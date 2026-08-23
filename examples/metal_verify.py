@@ -29,9 +29,9 @@ def softmax_rows(N: int, threads: int = 32, dtype: str = 'float32'):
     @T.prim_func
     def kern(A: T.Tensor((N, N), dtype), O: T.Tensor((N, N), dtype)):
         with T.Kernel(N, threads=threads) as bx:
-            row_s = T.alloc_shared((N,), dtype)
-            row_max = T.alloc_var(dtype)
-            row_sum = T.alloc_var(dtype)
+            row_s = T.alloc_shared((N,), dtype)  # shape: [N]
+            row_max = T.alloc_var(dtype)          # shape: []，标量
+            row_sum = T.alloc_var(dtype)          # shape: []，标量
             T.copy(A[bx, 0], row_s)
             # GPU/CUDA 标准写法：row_max = -T.infinity(dtype)
             # Mac/Metal 0.1.13 暂不支持 T.infinity，故用大负数字面量
@@ -73,17 +73,17 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     N = 1 << 20
-    a = torch.randn(N, device=dev)
-    b = torch.randn(N, device=dev)
+    a = torch.randn(N, device=dev)       # shape: [N]
+    b = torch.randn(N, device=dev)       # shape: [N]
     k1 = vector_add(N)
-    c = torch.empty(N, device=dev)
+    c = torch.empty(N, device=dev)       # shape: [N]
     k1(a, b, c)
     torch.testing.assert_close(c, a + b)
     print("✓ vector add")
 
     N = 256
-    A = torch.randn(N, N, device=dev)
-    O = torch.empty(N, N, device=dev)
+    A = torch.randn(N, N, device=dev)    # shape: [N, N]
+    O = torch.empty(N, N, device=dev)    # shape: [N, N]
     # GPU/CUDA 标准写法可以使用 128/256 个线程；32 对 Metal 兼容性更保守。
     k2 = softmax_rows(N, threads=32)   # Metal 兼容：threads<=32
     k2(A, O)

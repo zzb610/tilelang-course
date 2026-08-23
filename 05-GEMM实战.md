@@ -111,13 +111,13 @@ def gemm_v1(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
 
 ```python
 M, N, K = 4096, 4096, 4096
-A = torch.randn(M, K, device='cuda', dtype=torch.float16)
-B = torch.randn(K, N, device='cuda', dtype=torch.float16)
-C = torch.empty(M, N, device='cuda', dtype=torch.float16)
+A = torch.randn(M, K, device='cuda', dtype=torch.float16)   # shape: [M, K]
+B = torch.randn(K, N, device='cuda', dtype=torch.float16)   # shape: [K, N]
+C = torch.empty(M, N, device='cuda', dtype=torch.float16)   # shape: [M, N]
 
 kernel = gemm_v1(M, N, K)
 kernel(A, B, C)
-ref = A.to(torch.float32) @ B.to(torch.float32)
+ref = A.to(torch.float32) @ B.to(torch.float32)             # shape: [M, N]
 torch.testing.assert_close(C.float(), ref, rtol=1e-2, atol=1e-2)
 
 lat = kernel.get_profiler().do_bench()
@@ -139,7 +139,9 @@ M、N、K 不整除时，要分别处理三件事：
 再用无分支的主 kernel。下面是 guarded copy 的核心形状（完整代码中保留其余 v1 结构）：
 
 ```python
+# v0 教学基线：每个 block 负责 BM×BN 输出 tile，直接从 global 读取 K 维数据。
 for i, k in T.Parallel(BM, BK):
+    # A_s shape=[BM, BK]；只把合法的 A 元素搬入 shared。
     gi = by * BM + i
     gk = ko * BK + k
     if T.all_of(gi < M, gk < K):
@@ -148,6 +150,7 @@ for i, k in T.Parallel(BM, BK):
         A_s[i, k] = 0
 
 for k, j in T.Parallel(BK, BN):
+    # B_s shape=[BK, BN]；无效元素必须明确填 0。
     gk = ko * BK + k
     gj = bx * BN + j
     if T.all_of(gk < K, gj < N):
@@ -158,6 +161,7 @@ for k, j in T.Parallel(BK, BN):
 T.gemm(A_s, B_s, C_f)
 
 for i, j in T.Parallel(BM, BN):
+    # C_f shape=[BM, BN]；写回前保护 M/N 尾部。
     gi, gj = by * BM + i, bx * BN + j
     if T.all_of(gi < M, gj < N):
         C[gi, gj] = C_f[i, j]
