@@ -690,7 +690,7 @@ Attention 配对利用率 = 37 / 50 = 74%
   `cu_seqlens` 找到每条样本的起止偏移，并在每个 tile 中使用实际 `q_len/k_len`。
 - varlen 的正确性关键是三件事：packed 地址、query/key 尾部 guard、`Lq != Lk` 时的
   causal 对齐；性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。
-- 反向靠重计算；`exp2(x·scale)` 融合 `1/√d` 是值得炫耀的实现细节。
+- 反向靠重计算；`exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
 
 ## 6.7 Checkpoint
 

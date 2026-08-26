@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900">
+  <defs>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#e03131"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2f9e44"/>
+    </marker>
+    <style>
+      .title { font: 700 30px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2937; }
+      .subtitle { font: 400 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .heading { font: 700 23px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .body { font: 400 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #343a40; }
+      .small { font: 400 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #495057; }
+      .lane { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .bank { font: 700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+      .result { font: 700 19px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; }
+      .note { font: 400 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; text-anchor: middle; fill: #7f6000; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="900" fill="#ffffff"/>
+  <text x="60" y="55" class="title">Shared Memory Swizzle：用 XOR 打散 bank 访问</text>
+  <text x="60" y="94" class="subtitle">示例：warp 的线程按列访问行主序 tile，比较原始布局与教学化简的 XOR 映射</text>
+
+  <rect x="50" y="130" width="630" height="610" rx="12" fill="#fff5f5" stroke="#e03131" stroke-width="3"/>
+  <rect x="720" y="130" width="630" height="610" rx="12" fill="#ebfbee" stroke="#2f9e44" stroke-width="3"/>
+
+  <text x="80" y="174" class="heading" fill="#c92a2a">✗ 原始布局：列访问撞到同一个 bank</text>
+  <text x="750" y="174" class="heading" fill="#2b8a3e">✓ Swizzle 后：访问分散到多个 bank</text>
+  <text x="80" y="215" class="body">word_addr = lane × 32</text>
+  <text x="750" y="215" class="body">word_addr′ = word_addr XOR lane（教学化简）</text>
+  <text x="80" y="245" class="small">bank = word_addr % 32 = 0</text>
+  <text x="750" y="245" class="small">bank = word_addr′ % 32 = lane</text>
+
+  <text x="80" y="285" class="small">warp lanes</text>
+  <text x="750" y="285" class="small">warp lanes</text>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="600" text-anchor="middle" dominant-baseline="middle">
+    <g fill="#ffc9c9" stroke="#e03131" stroke-width="2">
+      <rect x="80" y="300" width="58" height="42" rx="5"/><rect x="145" y="300" width="58" height="42" rx="5"/>
+      <rect x="210" y="300" width="58" height="42" rx="5"/><rect x="275" y="300" width="58" height="42" rx="5"/>
+      <rect x="340" y="300" width="58" height="42" rx="5"/><rect x="405" y="300" width="58" height="42" rx="5"/>
+      <rect x="470" y="300" width="58" height="42" rx="5"/><rect x="535" y="300" width="58" height="42" rx="5"/>
+    </g>
+    <g fill="#b2f2bb" stroke="#2f9e44" stroke-width="2">
+      <rect x="750" y="300" width="58" height="42" rx="5"/><rect x="815" y="300" width="58" height="42" rx="5"/>
+      <rect x="880" y="300" width="58" height="42" rx="5"/><rect x="945" y="300" width="58" height="42" rx="5"/>
+      <rect x="1010" y="300" width="58" height="42" rx="5"/><rect x="1075" y="300" width="58" height="42" rx="5"/>
+      <rect x="1140" y="300" width="58" height="42" rx="5"/><rect x="1205" y="300" width="58" height="42" rx="5"/>
+    </g>
+    <g fill="#5f3b75">
+      <text x="109" y="321">t0</text><text x="174" y="321">t1</text><text x="239" y="321">t2</text><text x="304" y="321">t3</text>
+      <text x="369" y="321">t4</text><text x="434" y="321">t5</text><text x="499" y="321">t6</text><text x="564" y="321">t7</text>
+    </g>
+    <g fill="#1b4332">
+      <text x="779" y="321">t0</text><text x="844" y="321">t1</text><text x="909" y="321">t2</text><text x="974" y="321">t3</text>
+      <text x="1039" y="321">t4</text><text x="1104" y="321">t5</text><text x="1169" y="321">t6</text><text x="1234" y="321">t7</text>
+    </g>
+  </g>
+
+  <text x="80" y="375" class="small">所有线程的列地址相差 32 个 word</text>
+  <text x="750" y="375" class="small">低位被 lane-dependent mask 打散</text>
+
+  <rect x="80" y="420" width="540" height="105" rx="8" fill="#ffe3e3" stroke="#e03131" stroke-width="2"/>
+  <text x="350" y="452" class="bank" fill="#c92a2a">bank 0</text>
+  <text x="350" y="486" class="body" text-anchor="middle">t0、t1、…、t7 同时访问</text>
+  <text x="350" y="512" class="result" fill="#c92a2a">32 路冲突（教学上的最坏情形）</text>
+
+  <g>
+    <rect x="750" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="815" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="880" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="945" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="1010" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="1075" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="1140" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <rect x="1205" y="420" width="58" height="105" rx="6" fill="#d3f9d8" stroke="#2f9e44" stroke-width="2"/>
+    <g class="bank" fill="#2b8a3e">
+      <text x="779" y="463">bank 0</text><text x="844" y="463">bank 1</text><text x="909" y="463">bank 2</text><text x="974" y="463">bank 3</text>
+      <text x="1039" y="463">bank 4</text><text x="1104" y="463">bank 5</text><text x="1169" y="463">bank 6</text><text x="1234" y="463">bank 7</text>
+    </g>
+    <text x="1020" y="495" class="result" fill="#2b8a3e">访问分散，冲突显著减少</text>
+  </g>
+
+  <g stroke="#e03131" stroke-width="2" marker-end="url(#arrow-red)" opacity="0.68">
+    <line x1="109" y1="345" x2="350" y2="414"/><line x1="174" y1="345" x2="350" y2="414"/>
+    <line x1="239" y1="345" x2="350" y2="414"/><line x1="304" y1="345" x2="350" y2="414"/>
+    <line x1="369" y1="345" x2="350" y2="414"/><line x1="434" y1="345" x2="350" y2="414"/>
+    <line x1="499" y1="345" x2="350" y2="414"/><line x1="564" y1="345" x2="350" y2="414"/>
+  </g>
+  <g stroke="#2f9e44" stroke-width="2" marker-end="url(#arrow-green)" opacity="0.68">
+    <line x1="779" y1="345" x2="779" y2="414"/><line x1="844" y1="345" x2="844" y2="414"/>
+    <line x1="909" y1="345" x2="909" y2="414"/><line x1="974" y1="345" x2="974" y2="414"/>
+    <line x1="1039" y1="345" x2="1039" y2="414"/><line x1="1104" y1="345" x2="1104" y2="414"/>
+    <line x1="1169" y1="345" x2="1169" y2="414"/><line x1="1234" y1="345" x2="1234" y2="414"/>
+  </g>
+
+  <rect x="50" y="770" width="1300" height="85" rx="10" fill="#fff3bf" stroke="#d39e00" stroke-width="2"/>
+  <text x="700" y="805" class="note">swizzle 改变物理地址/线程映射，不改变 tensor 的逻辑 shape。</text>
+  <text x="700" y="833" class="note" font-size="16">真实 mask 由 tile 形状、MMA 指令和目标架构决定；图中 XOR 仅用于建立直觉。</text>
+</svg>

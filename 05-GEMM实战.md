@@ -65,7 +65,7 @@ def gemm_naive(M: int, N: int, K: int, BM: int = 64, BN: int = 64,
 很差 → 访存量接近 O(MNK)。这是用于建立对照的教学基线；先用小尺寸验证它，再进入
 shared/GEMM 路径，不要把它当作生产实现。
 
-## 5.3 版本 1：分块 + 共享内存 + 流水线（官方标准骨架）
+## 5.3 版本 1：分块 + 共享内存 + 流水线
 
 核心改动：K 维切成 `BK` 的块；每轮的 `A/B` tile 先 `T.copy` 进共享内存，再用
 `T.gemm` 一句完成 tile 级矩阵乘。具体会落到哪类 Tensor Core/后端指令由目标 GPU、

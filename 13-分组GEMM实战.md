@@ -10,9 +10,12 @@
 - 本章产出：一份 grouped GEMM 正确性测试、一张分组元数据表、一份 kernel-only 与 end-to-end 性能对比；
 - 官方参考：[Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)、[TileLang fused-MoE 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)。
 
-**阅读路线：**先用数学定义和小例子理解“每组的 `M_g` 不同”到底意味着什么；再看 packed layout、offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理空组、尾部 tile、形状分桶和端到端 MoE 开销。不要一开始就把 `group_idx_for_block` 当成某个固定 API：它本质上是“把线性 block 映射回组编号”的元数据。
+**阅读路线：**先用数学定义和小例子说明“每组的 `M_g` 不同”会改变什么；再看 packed layout、
+offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理空组、尾部 tile、
+形状分桶和端到端 MoE 开销。不要一开始把 `group_idx_for_block` 当成固定 API：在本章中，
+它只是把线性 block 映射回组编号的元数据。
 
-## 13.1 为什么需要分组 GEMM？
+## 13.1 为什么需要分组 GEMM
 
 普通 GEMM 只有一组矩阵：
 
@@ -55,7 +58,7 @@ expert 3: A3[64, 4096]  × B3[4096, 11008] → C3[64, 11008]
 
 如果所有组的形状完全相同，优先先考虑 batched GEMM；只有当形状不规则、需要不同指针或需要和路由后的 token 排布结合时，grouped GEMM 才真正体现价值。
 
-### 13.1.2 MoE 中它处在什么位置？
+### 13.1.2 分组 GEMM 在 MoE 中的位置
 
 分组 GEMM 不是完整的 MoE，而是 MoE 中间的一段计算：
 
@@ -295,7 +298,7 @@ group_idx_for_block 的长度 == sum(ceildiv(group_sizes[g], BM))
 
 当 `group_sizes[g] == 0` 时，`m_blocks[g] == 0`，因此不会生成对应 block。这样做的好处是没有空计算；代价是 kernel 的 group 映射只覆盖非空组。若工程接口要求每个 group 都保留一个工作项，可以给空组分配一个 dummy block，但必须让它在进入 `T.copy`/`T.gemm` 前直接退出或跳过写回，不能对无效地址做读取。
 
-### 13.5.1 A 的 padding 怎么做？
+### 13.5.1 A 的 padding 做法
 
 教学骨架使用 `A_padded`，它的每组行数已经向上补齐到 `BM`，并且补齐行写成 0：
 
@@ -387,7 +390,7 @@ def grouped_gemm_padded(
 
 这说明一个重要事实：**Grouped GEMM 不是把 `T.gemm` 换成另一种乘法，而是在普通 tiled GEMM 外面增加“组选择、地址偏移和尾部管理”。**
 
-### 13.6.2 为什么没有在内层循环反复查 group？
+### 13.6.2 不在内层循环反复查 group 的原因
 
 `group_id` 在一个 M tile 内是常量。正确做法是每个 block 只读取一次组编号，然后把它用于：
 
@@ -397,7 +400,7 @@ def grouped_gemm_padded(
 
 不要在 `T.Parallel(block_m, block_n)` 的每个元素里再次搜索 `group_id`。那会把本应是 block 级的元数据开销放大到 element 级，并且使访问和分支更难优化。
 
-### 13.6.3 这个骨架为什么不直接承诺可运行？
+### 13.6.3 这个骨架不直接承诺可运行的原因
 
 Grouped GEMM 的实际签名会受以下因素影响：
 
@@ -520,7 +523,7 @@ TFLOPS = 2 * sum(M_g * K * N) / latency_ms / 1e9
 - 生成源码或 profiler 证据；
 - 一句明确的结论：改了什么、观察到什么、为什么相信收益来自这个变量。
 
-### 13.9.1 分桶为什么常常比盲目扩大 tile 更有效？
+### 13.9.1 分桶为什么常常比扩大 tile 更有效
 
 若一批 group 的 `M_g` 差异很大，一个统一的 `BM` 很难同时照顾大组和小组：
 
@@ -565,7 +568,7 @@ def check_group_metadata(group_sizes, row_offsets, padded_offsets, group_idx_for
 
 如果 `G=1` 都不正确，先不要调 grouped mapping；如果 `G=1` 正确而 `G>1` 错误，优先打印 `group_id`、`group_row0`、`output_row0` 和 `valid_m`。
 
-### 13.10.3 `T.print` 应该打印什么？
+### 13.10.3 `T.print` 的打印对象
 
 调试输入缩小后，每个 M block 只打印一次：
 
