@@ -1,6 +1,6 @@
 # 第 13 章 分组 GEMM：从多个小矩阵到 MoE 内核
 
-> **本章目标**：理解分组 GEMM（Grouped GEMM）为什么出现在 Mixture of Experts（MoE）等模型中，掌握不规则矩阵组的表示、tile 映射和边界处理，并能用 TileLang 写出一个“多个小 GEMM 共用一次调度”的内核骨架。
+> **本章目标**：理解分组 GEMM（Grouped GEMM）为什么出现在 Mixture of Experts（MoE）等模型中，掌握不规则矩阵组的表示、tile 映射和边界处理，并能用 TileLang 写出一个「多个小 GEMM 共用一次调度」的内核骨架。
 
 **学习信息**
 
@@ -10,7 +10,7 @@
 - 本章产出：一份 grouped GEMM 正确性测试、一张分组元数据表、一份 kernel-only 与 end-to-end 性能对比；
 - 官方参考：[Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)、[TileLang fused-MoE 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)。
 
-**阅读路线：**先用数学定义和小例子说明“每组的 `M_g` 不同”会改变什么；再看 packed layout、
+**阅读路线：**先用数学定义和小例子说明「每组的 `M_g` 不同」会改变什么；再看 packed layout、
 offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理空组、尾部 tile、
 形状分桶和端到端 MoE 开销。不要一开始把 `group_idx_for_block` 当成固定 API：在本章中，
 它只是把线性 block 映射回组编号的元数据。
@@ -19,19 +19,19 @@ offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；�
 
 普通 GEMM 只有一组矩阵：
 
-\[
+$$
 C = A \times B,\qquad A\in\mathbb{R}^{M\times K},
 B\in\mathbb{R}^{K\times N}, C\in\mathbb{R}^{M\times N}.
-\]
+$$
 
 分组 GEMM 则同时计算 `G` 组矩阵：
 
-\[
+$$
 C_g = A_g \times B_g,
 \qquad A_g\in\mathbb{R}^{M_g\times K},
 B_g\in\mathbb{R}^{K\times N},
 C_g\in\mathbb{R}^{M_g\times N}.
-\]
+$$
 
 本章先假设所有组共享 `K/N`，但每组的 `M_g` 可以不同。这正是 token 被路由到不同 expert 后常见的形状：每个 expert 收到的 token 数不同，但隐藏维度和 expert 中间维度通常相同。
 
@@ -76,7 +76,7 @@ combine/scatter：把结果还原到原始 token 顺序并做权重合并
 
 ## 13.2 先选一种数据表示
 
-Grouped GEMM 的第一个工程决策不是 tile 大小，而是“矩阵组如何放在内存里”。下面先采用一种适合教学和 MoE 的 packed layout。
+Grouped GEMM 的第一个工程决策不是 tile 大小，而是「矩阵组如何放在内存里」。下面先采用一种适合教学和 MoE 的 packed layout。
 
 ### 13.2.1 Packed layout：把 A 和 C 按行拼接
 
@@ -98,9 +98,9 @@ row_offsets = [0, M0, M0+M1, M0+M1+M2, ...]
 
 对第 `g` 组：
 
-\[
+$$
 A_g = A_{pack}[row\_offsets[g]:row\_offsets[g+1], :],
-\]
+$$
 
 `C_g` 使用同样的行区间。这样，输入和输出可以保持连续存储，只有权重 `B` 需要通过组编号索引。
 
@@ -188,36 +188,36 @@ def grouped_gemm_separate_launches(A_pack, B_stack, row_offsets):
 
 设 `BM/BN` 是输出 tile 大小，并假设 `N` 共享，则第 `g` 组的 tile 数为：
 
-\[
+$$
 T_g = \left\lceil\frac{M_g}{BM}\right\rceil
       \times\left\lceil\frac{N}{BN}\right\rceil.
-\]
+$$
 
 再定义 tile 前缀和：
 
-\[
+$$
 P_0=0,\qquad P_{g+1}=P_g+T_g.
-\]
+$$
 
 于是，线性 block `b` 属于满足下面条件的组：
 
-\[
+$$
 P_g \le b < P_{g+1}.
-\]
+$$
 
 组内 tile 编号是：
 
-\[
+$$
 local\_tile=b-P_g.
-\]
+$$
 
 再把它拆成二维坐标：
 
-\[
+$$
 by=\left\lfloor\frac{local\_tile}{\lceil N/BN\rceil}\right\rfloor,
 \qquad
 bx=local\_tile\bmod\lceil N/BN\rceil.
-\]
+$$
 
 ### 13.4.2 具体例子
 
@@ -388,7 +388,7 @@ def grouped_gemm_padded(
 4. **K 循环**：组内 GEMM 的 K 维仍然使用第 05 章的 `T.Pipelined`、shared tile、fragment 累加器和 `T.gemm`。
 5. **输出保护**：最后一个 M tile 可能只有一部分真实行，`valid_m` 防止把 padding 结果写回 `C_pack`。
 
-这说明一个重要事实：**Grouped GEMM 不是把 `T.gemm` 换成另一种乘法，而是在普通 tiled GEMM 外面增加“组选择、地址偏移和尾部管理”。**
+这说明一个重要事实：**Grouped GEMM 不是把 `T.gemm` 换成另一种乘法，而是在普通 tiled GEMM 外面增加「组选择、地址偏移和尾部管理」。**
 
 ### 13.6.2 不在内层循环反复查 group 的原因
 
@@ -440,7 +440,7 @@ Grouped GEMM 最容易出现的错误不是矩阵乘公式写错，而是组边�
 - 在 metadata 阶段过滤空组，但保留原始 `group_id`；
 - 为每个空组保留一个 dummy 工作项，在 kernel 中直接跳过读写。
 
-第一种通常减少无效工作，第二种更容易保持固定的组编号表。无论采用哪种方式，都要测试“全部为空”“中间为空”和“最后为空”。
+第一种通常减少无效工作，第二种更容易保持固定的组编号表。无论采用哪种方式，都要测试「全部为空」「中间为空」和「最后为空」。
 
 ### 13.7.4 N/K 不同的组
 
@@ -464,23 +464,23 @@ Grouped GEMM 的性能报告至少要有两种口径：
 
 有用的数学量是：
 
-\[
+$$
 FLOPs_{useful}=2\sum_g M_gKN.
-\]
+$$
 
 如果 M 方向向上 padding，实际执行的近似计算量是：
 
-\[
+$$
 FLOPs_{padded}=2\sum_g
 \left\lceil\frac{M_g}{BM}\right\rceil BM\cdot K\cdot N.
-\]
+$$
 
 可以报告 padding 利用率：
 
-\[
+$$
 \rho_M=\frac{\sum_g M_g}
 {\sum_g \lceil M_g/BM\rceil BM}.
-\]
+$$
 
 例如 `M=[32,128,7,64]`、`BM=128` 时：
 
@@ -490,7 +490,7 @@ FLOPs_{padded}=2\sum_g
 M 方向利用率   = 231 / 512 ≈ 45.1%
 ```
 
-这只是 M 方向的利用率，不等于最终 TFLOPS；但它能帮助解释“为什么一个看似减少 launch 的 grouped kernel 仍然不快”。
+这只是 M 方向的利用率，不等于最终 TFLOPS；但它能帮助解释「为什么一个看似减少 launch 的 grouped kernel 仍然不快」。
 
 ### 13.8.4 TFLOPS 口径
 
@@ -500,7 +500,7 @@ M 方向利用率   = 231 / 512 ≈ 45.1%
 TFLOPS = 2 * sum(M_g * K * N) / latency_ms / 1e9
 ```
 
-对于 padding kernel，建议同时报告 useful TFLOPS 和 padded TFLOPS，避免用“包含无效行的计算量”掩盖真实利用率。
+对于 padding kernel，建议同时报告 useful TFLOPS 和 padded TFLOPS，避免用「包含无效行的计算量」掩盖真实利用率。
 
 ## 13.9 优化路线：一次只改变一个变量
 
@@ -596,7 +596,7 @@ M=[130,32,256], N=256, BM=BN=128
 
 ### 练习 3：修改
 
-修改 `build_group_metadata`，让它同时返回 `tile_offsets` 和 `group_idx_for_tile`。比较“精确 tile 映射”和“按 M 方向 padded mapping”的 metadata 大小与 kernel 逻辑。
+修改 `build_group_metadata`，让它同时返回 `tile_offsets` 和 `group_idx_for_tile`。比较「精确 tile 映射」和「按 M 方向 padded mapping」的 metadata 大小与 kernel 逻辑。
 
 ### 练习 4：实现
 
@@ -623,7 +623,7 @@ M=[130,32,256], N=256, BM=BN=128
 
 ### Checkpoint
 
-本章完成标准不是“能背出 Grouped GEMM 的定义”，而是留下以下产物：
+本章完成标准不是「能背出 Grouped GEMM 的定义」，而是留下以下产物：
 
 1. 一份 host 侧参考实现和至少 3 组边界测试；
 2. 一张包含 `group_sizes`、`row_offsets`、`padded_offsets`、`group_idx_for_block` 的 metadata 表；

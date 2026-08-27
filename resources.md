@@ -7,7 +7,7 @@
 - 教程主线只依赖相对稳定的概念：TIR、`T.Kernel`、`T.Parallel`、`T.copy`、`T.Pipelined`、`T.gemm`、正确性测试和基本计时。
 - `TMA`、warpgroup、Tensor Memory、特定 `GemmWarpPolicy`、autotuner 持久化格式以及 pass 名称都属于版本/架构敏感内容。使用前先运行本地 API 检查，并以当前官方示例为准。
 - 性能数字不是课程常数。报告中必须记录 GPU、驱动、CUDA/ROCm、TileLang、PyTorch、dtype、输入尺寸、warmup、rep 和计时 backend。
-- 课程示例优先保证“能解释、能验证”。对任意尺寸的 GEMM/Attention，不能只依赖自动 safe-access；越界 tile 的填充值、输出 guard 和 K 维 padding 必须明确设计。
+- 课程示例优先保证「能解释、能验证」。对任意尺寸的 GEMM/Attention，不能只依赖自动 safe-access；越界 tile 的填充值、输出 guard 和 K 维 padding 必须明确设计。
 
 ## TileLang 官方资源
 

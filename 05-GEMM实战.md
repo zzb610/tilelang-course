@@ -1,7 +1,7 @@
 # 第 05 章 GEMM 实战：从朴素实现到可测优化
 
-> **本章目标**：围绕同一个 FP16 GEMM，按“正确基线 → 数据复用 → 流水线 → 布局/调度
-> → 自动调优”的顺序做实验。每一版只改变一个主要因素，并用正确性、生成代码和
+> **本章目标**：围绕同一个 FP16 GEMM，按「正确基线 → 数据复用 → 流水线 → 布局/调度
+> → 自动调优」的顺序做实验。每一版只改变一个主要因素，并用正确性、生成代码和
 > profiler 说明收益来自哪里；本章不承诺任何固定的峰值比例。
 
 **学习信息**
@@ -12,9 +12,9 @@
 - 本章产出：一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表和一份 TFLOPS 报告。
 - 参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、[TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
 
-**阅读路线：**先用 v0 建立“能算对但访存重复”的对照，再只引入 shared tile，随后引入
+**阅读路线：**先用 v0 建立「能算对但访存重复」的对照，再只引入 shared tile，随后引入
 流水线。v2 专门处理任意尺寸，v3 只做布局和 block 调度实验，v4 才把已知的参数空间
-交给 autotune。每次实验都保留上一版，避免把多个变化混成一个“黑盒加速”。
+交给 autotune。每次实验都保留上一版，避免把多个变化混成一个「黑盒加速」。
 
 ## 5.1 问题与理论峰值
 
@@ -102,7 +102,7 @@ def gemm_v1(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
 1. 网格：`(N/BN) × (M/BM)` 个 block，每个 block 负责一个 `BM×BN` 的输出 tile；
 2. **两级缓冲**：数据从 global 进 shared（`A_s/B_s`），再从 shared 进寄存器累加器
    （`C_f`，T.gemm 内部）。共享内存解决复用，寄存器解决 Tensor Core 数据格式；
-3. **流水线**：`T.Pipelined(..., num_stages=3)` 让"拷下一轮 tile"与"算本轮 tile"
+3. **流水线**：`T.Pipelined(..., num_stages=3)` 让「拷下一轮 tile」与「算本轮 tile」
    重叠——拷贝的数百周期延迟被藏进计算里；
 4. `T.gemm` 一个调用隐含：读共享内存 → 按 MMA 布局分发到线程 → 调 Tensor Core；
 5. 累加器 `C_f` 用 fp32：精度 + 匹配 Tensor Core 累加要求。
@@ -135,7 +135,7 @@ M、N、K 不整除时，要分别处理三件事：
 3. K 维尾部 tile 必须写入确定的 0，不能因为 safe-access 跳过写入就把 shared 中的旧值
    当成 padding。`T.clear(C_f)` 只能清累加器，不能清 `A_s/B_s`。
 
-教学阶段推荐“显式 guarded copy”；工程阶段也可以在 host 侧把 A/B pad 到 tile 整数倍，
+教学阶段推荐「显式 guarded copy」；工程阶段也可以在 host 侧把 A/B pad 到 tile 整数倍，
 再用无分支的主 kernel。下面是 guarded copy 的核心形状（完整代码中保留其余 v1 结构）：
 
 ```python
@@ -167,13 +167,13 @@ for i, j in T.Parallel(BM, BN):
         C[gi, gj] = C_f[i, j]
 ```
 
-> 这里的关键不是“写了几个 if”，而是把每一个可能的无效元素定义成 0，并单独保护
+> 这里的关键不是「写了几个 if」，而是把每一个可能的无效元素定义成 0，并单独保护
 > 输出。不同版本的 safe-access pass 可能自动插入 guard，但不会替你推断 GEMM padding
 > 的数值语义。先用 `M=1003, N=517, K=70` 这类尺寸做正确性测试，再测大尺寸。
 
 ## 5.5 版本 3：布局与光栅化（swizzle）
 
-这是"从会写到会调"的临门一脚：
+这是「从会写到会调」的临门一脚：
 
 ```python
 from tilelang.cuda.intrinsics import make_mma_swizzle_layout
@@ -211,7 +211,7 @@ def gemm_v3(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
     return kern
 ```
 
-`T.use_swizzle(panel_size=10, enable=True)` 是另一个层面的"swizzle"——**光栅化
+`T.use_swizzle(panel_size=10, enable=True)` 是另一个层面的「swizzle」——**光栅化
 （rasterization）**：改变 block 的调度顺序（对角线优先而不是按行扫描），提高 L2
 命中率。放在 `T.Kernel` 上下文里即可：
 
@@ -290,7 +290,7 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 2. 用一个 M/N/K 都不整除的尺寸验证 guarded copy 或 host padding；
 3. 每次只打开一个开关：`num_stages`、布局 swizzle、rasterization、tile 尺寸；
 4. 以表格记录 latency、TFLOPS、shared memory/寄存器线索和生成代码观察；
-5. 解释为什么某个配置更快，不能只写“autotune 选中了它”。
+5. 解释为什么某个配置更快，不能只写「autotune 选中了它」。
 
 ## 口述自测（详答见第 10 章）
 

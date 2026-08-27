@@ -1,7 +1,7 @@
 # 第 06 章 FlashAttention 手写实现
 
 > **本章目标**：先从朴素 Attention 的存储问题出发，推导在线 softmax，再把公式映射到
-> 两个 tile GEMM 和一个分块循环。学习重点是“为什么这样更新仍然等价”，而不是先背
+> 两个 tile GEMM 和一个分块循环。学习重点是「为什么这样更新仍然等价」，而不是先背
 > 一份长代码；代码验证通过后，再讨论 IO、反向重计算和变体。
 
 **学习信息**
@@ -13,7 +13,7 @@
 - 参考：[TileLang examples](https://github.com/tile-ai/tilelang/tree/main/examples)、[CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
 
 **阅读路线：**先把 `S → P → O` 的数据形状写清楚；再只学习 `(m, l, O)` 三个在线状态；
-随后逐段阅读实现；最后分开做“整除尺寸正确性”和“尾部尺寸设计”。不要把 dense reference
+随后逐段阅读实现；最后分开做「整除尺寸正确性」和「尾部尺寸设计」。不要把 dense reference
 能否运行、kernel 是否正确、kernel 是否高效混成一个问题。
 
 ## 6.1 朴素 Attention 为什么慢
@@ -32,7 +32,7 @@ O = P @ V                  # [B,H,N,d]
    HBM，`P@V` 时再读回来——**同一份中间数据被存取两遍**。
 
 朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量是 O(N²·d)。FlashAttention
-的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护“部分归一化”，不把
+的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护「部分归一化」，不把
 完整 S/P 落盘。它不是把所有 Attention 的 HBM IO 变成 O(N)；更准确的 IO 上界依赖
 片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
 
@@ -58,7 +58,7 @@ l_new   = l_prev · exp(m_prev − m_new) + l_local · exp(m_local − m_new)
 ```
 
 输出也要重缩放：老块的每个输出行向量 `O_prev` 乘 `exp(m_prev − m_new)`。
-推导一句话：**归一化变了，分母换了，旧的分子乘上"换分母的修正因子"就行**——不用
+推导一句话：**归一化变了，分母换了，旧的分子乘上「换分母的修正因子」就行**——不用
 重读任何东西。
 
 TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做：
@@ -243,7 +243,7 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 # 性能实验时，再单独选择显存能承受的 N，并把 reference 与 kernel 的计时分开。
 ```
 
-## 6.4 反向传播：为什么"重计算"
+## 6.4 反向传播：为什么「重计算」
 
 反向需要 `P` 和 `S`，但前向从不落盘。FlashAttention 的做法（官方 bwd 示例
 `example_mha_bwd_bshd.py` 等）：**反向时用同样的分块循环重算 S/P**（用保存的
@@ -261,7 +261,7 @@ varlen 的核心不是改变 Attention 公式，而是改变输入的**存储布
 
 1. 去掉每条序列末尾的 padding，把有效 token 沿序列维拼接成一块；
 2. 用 `cu_seqlens` 记录每条序列在这块连续内存中的起止偏移；
-3. kernel 仍然按“一个 batch 样本 + 一个 query tile”计算，但通过偏移量找到该样本自己的 Q/K/V；
+3. kernel 仍然按「一个 batch 样本 + 一个 query tile」计算，但通过偏移量找到该样本自己的 Q/K/V；
 4. 最终输出仍按 packed 顺序写回，必要时再由宿主函数恢复成 padded layout。
 
 官方示例可参考 [example_mha_fwd_varlen.py](https://github.com/tile-ai/tilelang/blob/main/examples/flash_attention/example_mha_fwd_varlen.py)
@@ -574,7 +574,7 @@ offset = Lk - Lq
 4. 用 `torch.testing.assert_close` 比较 kernel 的 `out_unpad` 和 `ref_unpad`；
 5. 如果还需要 padded 输出，再单独执行 unpack，并检查每条样本的有效区间。
 
-下面的参考实现覆盖了不同的 `Lq/Lk`，并显式处理“没有可见 key”的 query。所有中间 tensor
+下面的参考实现覆盖了不同的 `Lq/Lk`，并显式处理「没有可见 key」的 query。所有中间 tensor
 的形状都写在注释中，便于对照 kernel 的 `[BM, BN]` 和 `[BM, D]` fragment。
 
 ```python
@@ -706,7 +706,7 @@ Attention 配对利用率 = 37 / 50 = 74%
 ## 口述自测（详答见第 10 章）
 
 1. **默写在线 softmax 三公式并解释每项**（尤其 rescaling 因子）。
-2. **FA 的 IO 复杂度推导与"为什么 memory-bound"**（O(N²)→O(N²·d²/M)）。
+2. **FA 的 IO 复杂度推导与「为什么 memory-bound」**（O(N²)→O(N²·d²/M)）。
 3. **为什么 P 不落盘、反向如何工作？**（重计算 + 存 lse）。
 4. **causal 掩码为什么放 GEMM 前初始化 acc_s 而不是 GEMM 后？**（避免把 −∞ 参与乘加，数值安全；`if_then_else` 直接写 fragment）。
 5. **`transpose_B=True` 是干嘛的？**（K 是 `[block_N, dim]`，S=Q·Kᵀ 需要转置）。

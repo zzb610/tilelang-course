@@ -1,6 +1,6 @@
 # 第 12 章 Cheatsheet 速查表
 
-> 这是“查表”，不是“学习顺序”。适合已经完成主线后快速确认 API、公式、排错入口和
+> 这是「查表」，不是「学习顺序」。适合已经完成主线后快速确认 API、公式、排错入口和
 > 报告字段；遇到概念不清，应回到第 01～09 章，而不是只看这里的单行结论。
 
 > 这是查表，不是跨版本 API 契约。`TMA`、warpgroup、TMEM、执行后端、autotune
@@ -218,10 +218,10 @@ with set_autotune_inputs(A, B, C):
 
 ## 8. 面试 30 秒自我介绍稿（模板）
 
-"我使用 TileLang（基于 TVM TIR 的 GPU 内核 DSL）做过 [算子名]：从朴素版本到
+「我使用 TileLang（基于 TVM TIR 的 GPU 内核 DSL）做过 [算子名]：从朴素版本到
 分块 + 软件流水线 + swizzle 布局 + 自动调优，最终 [X] TFLOPS，达到硬件峰值的
 [Y]%，与 cuBLAS 对比 [结论]。我的方法：先判断 memory/compute bound，再画数据流，
-逐项优化并用 profiler 验证，最后用 Nsight 归因剩余差距。"
+逐项优化并用 profiler 验证，最后用 Nsight 归因剩余差距。」
 
 ---
 
