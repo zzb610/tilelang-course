@@ -126,7 +126,7 @@ C_ptrs[g] → C_g
 4. 第一版把每组的 `M_g` 向上补齐到 `BM`，补齐行写成 0；
 5. `K` 和 `N` 先使用能整除 `BK/BN` 的尺寸，尾部处理放在 13.7。
 
-这不是 grouped GEMM 的唯一形式，而是一个便于验证索引和数据流的教学基线。
+这只是便于验证索引和数据流的一种教学基线，grouped GEMM 还有其它表示形式。
 
 ## 13.3 参考实现：先保证每组结果正确
 
@@ -458,7 +458,7 @@ Grouped GEMM 的性能报告至少要有两种口径：
 
 把上游 token 重排、metadata 构造、kernel、结果恢复都计入。它回答的是：**在真实模型路径里，这个设计是否值得？**
 
-两者差距很大时，优化方向通常不是继续调 `BM/BN`，而是减少重复 pack、缓存稳定 metadata，或把 dispatch/grouped GEMM/combine 做更紧的融合。
+两者差距很大时，继续调 `BM/BN` 往往收效有限；更应先减少重复 pack、缓存稳定 metadata，或把 dispatch/grouped GEMM/combine 做更紧的融合。
 
 ### 13.8.3 有效 FLOPs 和 padding FLOPs
 
@@ -630,6 +630,8 @@ M=[130,32,256], N=256, BM=BN=128
 3. 一个能解释 block→group→tile→输出行映射的 TileLang 内核骨架；
 4. 一份同时包含 kernel-only 和 end-to-end 的性能报告；
 5. 一段说明 grouped GEMM 何时应该退回 batched GEMM、分桶 kernel 或现成库的工程判断。
+6. 若把本章作为 Capstone，补充 group-size 分布、路由/pack/scatter 成本和 dispatch 范围，
+   不能只提交矩阵乘 kernel 的最快数字。
 
 ## 13.12 本章小结
 
@@ -639,6 +641,9 @@ M=[130,32,256], N=256, BM=BN=128
 - padding、空组、K/N 尾部、分组倾斜和端到端 dispatch 都可能决定最终性能；
 - 先建立逐组参考和正确 baseline，再做 packed、分桶、pipeline、layout 和 persistent 调度实验；
 - 具体 API、布局约束和后端支持以当前 TileLang 官方 grouped GEMM 示例为准。
+
+下一步进入 [第 14 章](14-Capstone真实算子交付.md)，把本章的 grouped GEMM 放回完整
+MoE 路径，或选择另一个真实算子完成契约、测试、优化、库对比和 fallback。
 
 ## 13.13 口述自测
 

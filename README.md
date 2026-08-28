@@ -11,7 +11,10 @@
 每一章都按「问题 → 心智模型 → 最小代码 → 验证 → 边界 → checkpoint」推进。读者不需要一次
 读完整章：先完成当前章节的最小产物，再进入下一章；性能结论必须和硬件、版本、输入及计时方法一起记录。
 
-课程默认以 NVIDIA CUDA GPU 为目标。没有 CUDA GPU 也可以学习语法和编译模型；macOS/Metal 只用于有限的 smoke test，不能用来替代 CUDA 的 GEMM、FlashAttention 或性能实验。
+课程默认以 NVIDIA CUDA GPU 为目标。没有 CUDA GPU 也可以学习语法、编译模型和
+compile-only 流程。当前 TileLang 已提供 Metal、HIP、LLVM、WebGPU、C 和 CuTe DSL 等
+target，Metal 也开始支持部分矩阵乘路径；但各后端的指令、算子覆盖和性能成熟度不同，
+不能把某一后端的结果外推到另一后端。
 
 ## 先读这里
 
@@ -23,20 +26,27 @@
 
 ## TileLang 是什么
 
-TileLang 是构建在 TVM/TIR 之上的 GPU/加速器内核 DSL。它把 tile、内存作用域、线程块、数据搬运和计算原语作为一等概念，让学习者在 Python 风格语法中表达接近硬件的程序结构。
+TileLang 是构建在 TVM/TIR 之上的 GPU/加速器内核 DSL。它的核心设计（见
+[TileLang 论文](https://arxiv.org/abs/2504.17577)）是**把数据流与调度空间解耦**：
+用户用 tile 算子（`T.copy`、`T.gemm`、`T.reduce` 等）描述「算什么、数据怎么流」，
+编译器自动完成线程绑定、内存布局、指令选择（tensorize）和软件流水线这四类调度；
+编译器默认方案不够好时，用户再用 `T.Pipelined`、`T.annotate_layout`、`T.use_swizzle`、
+`T.ptx` 等注解与原语逐个接管。整个课程就是反复练习这条「先信任推断、再用证据接管」的路线。
 
 可以先用三层心智模型理解它：
 
-- **高层**：表达计算和 tile 关系；
-- **中层**：控制 grid、shared memory、fragment、流水线和布局；
-- **底层**：必要时观察生成代码，使用 warp、PTX、TMA 或架构相关原语。
+- **高层（数据流）**：用 tile 算子表达计算和 tile 关系，不关心线程与布局；
+- **中层（调度）**：用 grid、shared memory、fragment、流水线和布局注解控制「谁在何时做」；
+- **底层（指令）**：必要时观察生成代码，使用 warp、PTX、TMA 或架构相关原语。
 
 这里的「层」是学习视角，不是保证每个版本都有固定的 L1/L2/L3 API。具体接口和支持范围以当前官方文档/示例为准。
+这套抽象与 Triton 的关键差别在第 02 章的「数据流算子与调度原语」表中展开。
 
 ## 课程结构
 
 前 09 章是递进的主线，第 10～12 章分别承担面试表达、迁移练习和查表任务，第 13 章是
-建立在 GEMM/MoE 经验之上的专项扩展。不要跳过前面的正确性与测量训练直接背模板。
+建立在 GEMM/MoE 经验之上的专项扩展，第 14 章负责真实算子交付。不要跳过前面的正确性
+与测量训练直接背模板。
 
 | 章节 | 主题 | 完成标志 | 难度 |
 |---|---|---|---|
@@ -53,6 +63,7 @@ TileLang 是构建在 TVM/TIR 之上的 GPU/加速器内核 DSL。它把 tile、
 | 11 | 练习题库与答案解析 | 用题目验证迁移，而不是只背概念 | — |
 | 12 | Cheatsheet 速查表 | 查 API、公式和排错关键词 | — |
 | 13 | 分组 GEMM 实战 | 能处理不规则 group、metadata 和 MoE 风格调度 | ★★★★★ |
+| 14 | Capstone：交付一个真实算子 | 完成需求、基线、边界、优化、集成和报告闭环 | ★★★★★ |
 
 ## 三条学习路线
 
@@ -66,7 +77,10 @@ TileLang 是构建在 TVM/TIR 之上的 GPU/加速器内核 DSL。它把 tile、
 
 **研究/工程路径**
 
-完成系统路径后，阅读 [官方 examples](https://github.com/tile-ai/tilelang/tree/main/examples)，选择一个算子，提交基线、边界测试、profile 报告、库对比和版本/硬件 caveat。若目标是 MoE 或不规则批量矩阵乘，再进入 [第 13 章：分组 GEMM 实战](13-分组GEMM实战.md)。
+完成系统路径后，先做 [第 14 章：Capstone](14-Capstone真实算子交付.md)。从
+[官方 examples](https://github.com/tile-ai/tilelang/tree/main/examples) 选择一个与你的硬件和
+工作负载匹配的算子，提交基线、边界测试、profile 报告、库对比和版本/硬件限制。若目标是
+MoE 或不规则批量矩阵乘，先完成 [第 13 章：分组 GEMM 实战](13-分组GEMM实战.md)。
 
 ## 环境检查
 
@@ -100,10 +114,12 @@ PY
 Metal 适合验证：
 
 - `@T.prim_func`、`T.Kernel`、`T.Parallel` 等基础语法；
-- vector add、部分 elementwise/reduce 示例；
+- vector add、部分 elementwise/reduce，以及当前版本支持的矩阵乘路径；
 - 生成的 Metal 源码查看。
 
-Metal 不适合作为本教程 CUDA 路径的性能基线。第 05/06 章的 `T.gemm`、Tensor Core、cp.async/TMA 和 Nsight 实验需要支持它们的目标 GPU/工具链。
+Metal 不适合作为本教程 CUDA 路径的性能基线。即使同一个 `T.gemm` 在 Metal 与 CUDA
+都能编译，两者也可能使用不同矩阵指令、tile 约束和工具链。`cp.async`、TMA 和 Nsight
+仍属于 CUDA 路径；Metal 实验应单独记录设备、系统、TileLang 版本和生成源码。
 
 ## 如何判断自己真的学会了
 
@@ -121,6 +137,7 @@ Metal 不适合作为本教程 CUDA 路径的性能基线。第 05/06 章的 `T.
 - [TileLang 官方仓库](https://github.com/tile-ai/tilelang)
 - [TileLang Getting Started](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)
 - [TileLang Language Basics](https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/language_basics.md)
+- [TileLang 论文（ICLR 2026）](https://proceedings.iclr.cc/paper_files/paper/2026/hash/76fb92288bf90360c527efb0d1c2aba6-Abstract-Conference.html)
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
 
 教程 API 和后端都在演进；若本地版本与正文不同，请优先看官方示例，并在实验记录中注明版本。

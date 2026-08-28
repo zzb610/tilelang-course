@@ -10,7 +10,9 @@
 - 前置：第 03～05 章，理解分块 GEMM、归约、mask 和 fp16/fp32 混合精度；
 - 运行范围：完整前向示例需要支持 `T.gemm`/fragment 的 GPU；先用小尺寸做正确性，不要直接运行大尺寸参考实现；
 - 本章产出：online softmax 推导、一份小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。
-- 参考：[TileLang examples](https://github.com/tile-ai/tilelang/tree/main/examples)、[CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
+- 参考：[官方 FlashAttention examples](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention)、
+  [DeepSeek MLA 文档](https://tilelang.com/deeplearning_operators/deepseek_mla.html) 和
+  [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
 
 **阅读路线：**先把 `S → P → O` 的数据形状写清楚；再只学习 `(m, l, O)` 三个在线状态；
 随后逐段阅读实现；最后分开做「整除尺寸正确性」和「尾部尺寸设计」。不要把 dense reference
@@ -257,7 +259,7 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 同一个 batch 里的句子长度可能分别是 4096、1732、287，若仍然把它们补齐到 4096，
 Attention 会对大量 padding token 做无效计算。
 
-varlen 的核心不是改变 Attention 公式，而是改变输入的**存储布局和索引方式**：
+varlen 的核心是改变输入的**存储布局和索引方式**，Attention 公式本身不变：
 
 1. 去掉每条序列末尾的 padding，把有效 token 沿序列维拼接成一块；
 2. 用 `cu_seqlens` 记录每条序列在这块连续内存中的起止偏移；
@@ -678,14 +680,60 @@ Attention 配对利用率 = 37 / 50 = 74%
   多个 block，最后用 lse 合并 partial result；核心仍然是在线 softmax 的可结合更新。
 - **反向 varlen**：除了前向的 `cu_seqlens_q/k`，还要保证梯度输出与 packed Q/K/V 的
   顺序一致；重计算的每个 tile 必须复用同一套边界和 causal 对齐规则。
+- **MLA（Multi-head Latent Attention，DeepSeek）**：见下面的专节——它是本章所有概念
+  （在线 softmax、fragment、`GemmWarpPolicy`、warp specialization）的汇合点。
+
+### 6.5.8.1 MLA decode：寄存器压力如何决定 warp 分工
+
+一篇社区工程文章（[Writing High-Performance Kernels in TileLang, from GEMM to MLA](https://huggingface.co/blog/AtlasCloud-AI/writing-high-performance-kernels-in-tilelang)）
+把 MLA 讲成了本章概念的总复习，核心难点不是数学而是**寄存器预算**：
+
+1. **形状**：MLA 的 query/key 宽 576（512 的 no-pe 部分 + 64 的 rope 部分）、value 宽 512，
+  所以输出累加器 `acc_o = [block_M, 512]` 必须在整个 KV 循环期间常驻寄存器。
+2. **硬件约束**：Hopper 的 `wgmma.mma_async` 把 4 个 warp（128 线程）绑成一个 warpgroup，
+  且要求 M ≥ 64。于是一个 warpgroup 至少要持有 64×512 的累加器——放不下，寄存器溢出后性能断崖。
+3. **解法**：`T.gemm` 的 `policy=T.GemmWarpPolicy.FullCol` 把输出沿 dim 维切给两个
+   warpgroup（各持 64×256），同时该 policy 把约束**反向传播**：`P@V` 的每个 warpgroup
+   需要完整的 `acc_s`，于是 staging buffer `S_shared` 也必须是 `[BM, BN]`，而 `Q@K` 阶段
+   每个 warpgroup 只算一半的 score slab。两个 warpgroup 各自写出一半 `acc_s`，再经
+   `S_shared` 交换补齐——**这一段数据交换由布局推断自动生成，你只需要选 policy、写数学**。
+4. **对照**：同样的设计在 CuTe 里要手写布局、swizzle、Tensor Core 对齐和
+   producer/consumer 同步；在 TileLang 里约 80 行，官方参考实现在论文评测中
+   （H100，fp16，batch 64/128）达到 FlashMLA 约 98% 的性能。
+
+论文 [TileLang 论文](https://arxiv.org/abs/2504.17577) 还记录了 MLA 对 PyTorch 约
+1075.9× 的加速（H100，相同评测设置）。这些数字只对论文/文章公开的环境成立；你的设备上
+应重跑官方 [FlashMLA 教程](https://tilelang.com/deeplearning_operators/deepseek_mla.html)，
+并单独记录 tile、policy、warpgroup 数与生成源码。
+
+这节想传递的结论是：**当寄存器不够时，改的不是数学，而是 warp policy 与 staging**；
+第 07 章的布局推断在这里兑现为「选一个 policy，编译器替你完成数据交换」。
+
+### 6.5.9 先按语义选示例，不按文件名复制
+
+官方目录同时包含 MHA/GQA、前向/反向、BSHD/BHSD、固定长度/varlen 等实现。复制代码前
+先列出自己的六个条件：
+
+| 条件 | 需要确认的内容 |
+|---|---|
+| 训练还是推理 | 是否需要反向、dropout、保存或重算 LSE |
+| MHA/GQA/MQA | query head 到 KV head 的映射 |
+| 张量布局 | BSHD、BHSD 或 packed `[total_tokens, H, D]` |
+| mask 语义 | non-causal、causal、局部窗口或 block-causal |
+| 长度模型 | 固定长度、varlen、paged KV cache |
+| 目标架构 | 可用的矩阵指令、TMA、warp specialization 和 tile 限制 |
+
+社区的 MLA 教程适合观察寄存器压力、warp 分工和真实 decode 工作负载，但不能把其中的
+tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接近的官方测试文件出发，再
+保留自己的 reference 和 edge cases。
 
 ## 6.6 本章小结
 
 - 朴素 Attention 慢在 **N² 中间张量的 HBM 往返**；FA 用**分块 + 在线 softmax**
   避免完整 S/P 落盘，实际 IO 仍取决于片上容量和 tile 设计。
 - 公式三件套：`m_new=max(m_old,m_local)`，`l_new=l_old·e^(m_old−m_new)+l_local·e^(m_local−m_new)`，`O_old *= e^(m_old−m_new)`。
-- TileLang 实现 = 2 个 `T.gemm`（QKᵀ、PV）+ fragment 里的 max/exp2/sum + 掩码，
-  约 90 行。
+- TileLang 实现的主干是 2 个 `T.gemm`（QKᵀ、PV）加 fragment 中的 max/exp2/sum 与
+  掩码；实际代码长度取决于布局、边界、变长、反向和目标架构。
 - varlen 不改变 Attention 公式，而是将 Q/K/V 打包成 `[total_tokens, H, D]`，用
   `cu_seqlens` 找到每条样本的起止偏移，并在每个 tile 中使用实际 `q_len/k_len`。
 - varlen 的正确性关键是三件事：packed 地址、query/key 尾部 guard、`Lq != Lk` 时的

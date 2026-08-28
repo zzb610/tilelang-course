@@ -23,13 +23,28 @@
 - 计算量：`2·M·N·K` FLOPs；
 - 理论峰值取决于 GPU 型号、dtype、稀疏模式、时钟和库路径；请把目标 GPU 的官方规格
   填入实验记录，不要把某张卡的数字当作课程常数；
-- 目标不是只追求一个快的数字，而是在明确硬件和测量方法的前提下找到证据。
+- 目标是在明确硬件和测量方法的前提下找到证据，单求一个快的数字不够。
 
 衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。与 cuBLAS/torch 的比较必须
 使用相同输入、dtype、warmup、rep 和同步方式；不要把历史 benchmark 数字直接套到自己的机器。
 
 这里的公式把延迟单位写成毫秒；等价地，也可以先把延迟换算成秒，再除以 `1e12`。
 如果只统计 A/B 的读取或使用了不同的矩阵乘定义，应在报告中明确说明 FLOPs 口径。
+
+### 5.1.1 先钉死精度语义：fp32 的 `T.gemm` 可能悄悄变成 TF32
+
+"Correct but Slow" 研究（[arxiv 2607.04454](https://arxiv.org/abs/2607.04454)，A100 实测）
+报告过一个必须先知道的陷阱：在 SM80 上，fp32 输入的 `T.gemm` 会**静默降级为 TF32**
+（TensorFloat-32，尾数 10 位），导致 31.8% 的输出无法通过 `rtol=1e-5` 的 fp32 检查，
+而同样形状的手工 FMA 循环却能通过。报告把它归为「精度降级伪影」而非内核 bug。
+
+教程的处理约定：
+
+1. 本章示例统一用 fp16 输入 + fp32 累加，避开这条路径；
+2. 任何声称「fp32 GEMM」的报告，都要写清实际执行的精度路径（fp32 还是 TF32），
+   并用严格的 `rtol`（如 `1e-5`）与参考实现对照后再下结论；
+3. 如果你的 TileLang 版本在目标架构上对 fp32 `T.gemm` 有显式开关或文档说明，
+   以当前版本为准；否则默认把它当作「TF32 精度」来陈述。
 
 ## 5.2 版本 0：不碰共享内存（教学用）
 
@@ -103,7 +118,7 @@ def gemm_v1(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
 2. **两级缓冲**：数据从 global 进 shared（`A_s/B_s`），再从 shared 进寄存器累加器
    （`C_f`，T.gemm 内部）。共享内存解决复用，寄存器解决 Tensor Core 数据格式；
 3. **流水线**：`T.Pipelined(..., num_stages=3)` 让「拷下一轮 tile」与「算本轮 tile」
-   重叠——拷贝的数百周期延迟被藏进计算里；
+   重叠——让部分数据搬运等待隐藏在计算后面；能隐藏多少要由生成代码和测量确认；
 4. `T.gemm` 一个调用隐含：读共享内存 → 按 MMA 布局分发到线程 → 调 Tensor Core；
 5. 累加器 `C_f` 用 fp32：精度 + 匹配 Tensor Core 累加要求。
 
@@ -167,8 +182,8 @@ for i, j in T.Parallel(BM, BN):
         C[gi, gj] = C_f[i, j]
 ```
 
-> 这里的关键不是「写了几个 if」，而是把每一个可能的无效元素定义成 0，并单独保护
-> 输出。不同版本的 safe-access pass 可能自动插入 guard，但不会替你推断 GEMM padding
+> 这里的关键是把每一个可能的无效元素定义成 0，并单独保护输出；写多少 `if` 本身不重要。
+> 不同版本的 safe-access pass 可能自动插入 guard，但不会替你推断 GEMM padding
 > 的数值语义。先用 `M=1003, N=517, K=70` 这类尺寸做正确性测试，再测大尺寸。
 
 ## 5.5 版本 3：布局与光栅化（swizzle）
@@ -197,7 +212,7 @@ def gemm_v3(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
             T.clear(C_f)
 
             if swizzle:
-                # 共享内存布局做 XOR swizzle：消除 bank conflict（详见第 07 章）
+                # 共享内存布局做 swizzle：改变 bank 映射，是否减少冲突要实测（第 07 章）
                 T.annotate_layout({
                     A_s: make_mma_swizzle_layout(A_s),
                     B_s: make_mma_swizzle_layout(B_s),
@@ -266,15 +281,55 @@ print(kernel.get_kernel_source()[:3000])
 `wgmma` 等）；`T.copy` 是否变成 `cp.async` + 屏障；K 循环是否出现 prologue/
 steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 
+### 5.7.1 大 GEMM 的两个结构性陷阱：调优网格与 L2 驻留
+
+"Correct but Slow" 研究在 A100/GH200 上给大尺寸 GEMM 归因出了两个值得提前知道的坑：
+
+1. **默认调优网格缺配置（RC2a）**。它测的 16384² GEMM 用教程默认的
+   `(BLOCK_M, BLOCK_N, BLOCK_K)` 网格只到 cuBLAS 的 59.7%；把 `GROUP_SIZE_M`
+   （L2 swizzle 参数）、`num_warps`、`num_stages` 一并纳入扫描后恢复到 81.9%。
+   教训：**autotune 的空间由你定义，缺的维度不会自动出现**——第 08 章的 config
+   空间至少要覆盖 tile、stages、threads/warps 与调度开关。
+2. **L2 驻留（RC2b）**。16384² 的 A+B+C 工作集约 1.6 GB，远超 A100 的 40 MB L2。
+   cuBLAS 通过 cuBLASLt 的 plan 选择器做了缓存分块（L2 命中 80.5%），通用 DSL 编译
+   缺少这类启发式时只有 49.4% 命中、呈 DRAM-bound。教训：大尺寸下
+   `T.use_swizzle`（光栅化调度）改善 L2 局部性的意义远超小尺寸，值得单独开关实验。
+
+这两项都属于「结构性残留」：改作者代码救不回来，要靠调度空间和缓存策略。第 09 章
+给出对应的 Nsight 判据（L2 命中率、DRAM 吞吐、TFLOPS 对扫参曲线）。
+
 ## 5.8 进阶方向（先知道它们解决什么问题）
 
 | 方向 | 解决什么 | 官方示例 |
 |---|---|---|
 | Split-K | 单个输出 tile 串行 K 过长时，把 K 拆给多个 block | `examples/gemm_splitk/` |
-| Persistent / Stream-K | 减少 block 启动/负载不均，波次效应（tail effect） | `examples/gemm_persistent/`、`gemm_streamk/` |
+| Persistent / Stream-K | 缓解波次尾部和 K 维工作分配不均 | `examples/gemm/example_gemm_persistent.py`、`examples/gemm_streamk/` |
 | FP8 / INT4 量化 GEMM | 低精度推理吞吐 | `examples/gemm_fp8/`、`gemm_int4/` |
 | 2:4 稀疏（T.gemm_sp） | 利用稀疏性翻倍算力 | `examples/gemm_sp/` |
-| 分组 GEMM | MoE 注意力场景 | `examples/grouped_gemm/` |
+| 分组 GEMM | MoE 专家计算和不规则矩阵批次 | `examples/grouped_gemm/` |
+
+选择进阶路线前先看问题形状。Split-K 增加局部结果合并，persistent kernel 可能降低并发
+灵活性，Stream-K 也会改变工作分配与归约成本。这三者各解决一类问题，不存在固定的升级顺序。
+
+### 5.8.1 “结果正确”和“值得替换库”是两道门槛
+
+社区教程常展示某个特定形状上接近或超过库实现的结果，但这不等于交付完成。
+一项面向 GPU DSL 的[经验研究](https://arxiv.org/abs/2607.04454) 专门量化了「结果正确但远慢于库」这一评估缺口。
+它的样本和设备有限，不能推广成「所有 TileLang 内核都慢」；可引出的正确结论是，真实交付至少要回答两组问题：
+
+1. **正确性覆盖**：整除、尾部、小尺寸、不同 dtype、转置和数值极端输入是否通过？
+2. **替换价值**：目标 shape 分布上的延迟、吞吐、编译成本和端到端收益，是否优于现有路径？
+
+一个内核通过 `assert_close`，只说明抽样输入上的数值结果符合容差。它可能仍然因为串行归约、
+不必要的类型转换、错误 tile 或调优空间太窄而非常慢。报告中应增加“相对库效率”一列：
+
+```text
+relative_efficiency = reference_library_latency / tilelang_latency
+```
+
+这里使用的是延迟比；数值大于 1 表示 TileLang 内核更快。必须保证两边输出语义、输入、精度、
+warmup、rep 和计时范围一致。若内核只在一个 shape 上占优，就把 dispatch 范围限制在该 shape
+bucket，而不是替换所有 GEMM。
 
 ## 5.9 本章小结
 

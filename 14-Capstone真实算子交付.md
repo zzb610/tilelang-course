@@ -1,0 +1,245 @@
+# 第 14 章 Capstone：交付一个真实算子
+
+> **本章目标**：把前 13 章的方法用于一个真实工作负载。你要选择一个范围可控的算子，
+> 建立参考实现和测试矩阵，写出正确的 TileLang 基线，再用生成代码与 profiler 完成至少
+> 两轮单变量优化。最终产物不是一段最快代码，而是一个知道何时启用、何时回退的算子模块。
+
+**学习信息**
+
+- 难度：综合；建议用时：1～2 周；
+- 前置：完成第 01～09 章；Grouped GEMM/MoE 项目还需第 13 章；
+- 运行范围：必须有与目标算子匹配的设备和参考库；无设备时只能完成选题、基线和
+  compile-only，不能通过性能验收；
+- 本章产出：可复现项目、正确性测试、性能矩阵、两轮优化记录、dispatch/fallback 规则和复盘；
+- 参考：[TileLang examples](https://github.com/tile-ai/tilelang/tree/main/examples)、
+  [TileLang Tools](https://tilelang.com/tools/index.html) 和 [资源页](resources.md)。
+
+**阅读路线：**先把选题缩到一个清楚的输入分布和设备，再建立不可跳过的参考实现；随后
+完成“正确但不一定快”的 TileLang 版本。只有测试矩阵全部通过，才进入 profile 和优化。
+最后把最优 kernel 放进 dispatch 表，并保留库 fallback。
+
+## 14.1 选题：先选工作负载，不先选高级指令
+
+一个合格选题同时满足四个条件：
+
+1. 你有真实或可解释的输入 shape 分布；
+2. 有可信的 PyTorch、vendor library 或现有框架实现作为参考；
+3. 一到两周内可以覆盖主要边界；
+4. 目标设备确实支持计划使用的 dtype 和指令路径。
+
+可以从官方 examples 的算子族中选择：
+
+| 方向 | 适合的起点 | 主要难点 | 不建议的第一目标 |
+|---|---|---|---|
+| Elementwise/fusion | cast、激活、残差融合 | 启动开销、向量化、广播 | 一开始加入动态量化和复杂索引 |
+| GEMV/小 GEMM | decode 线性层、瘦长矩阵 | 波次、带宽、库 dispatch | 只测 4,096³ 方阵 |
+| GEMM epilogue | bias、激活、量化融合 | 数值语义、fragment epilogue | 同时做 split-K、TMA 和低精度 |
+| Attention | 固定布局的 MHA/GQA 前向 | mask、在线 softmax、布局 | 首次就做 varlen 反向或 paged decode |
+| Grouped GEMM | MoE expert 计算 | metadata、倾斜分组、padding | 不记录路由和 pack/scatter 成本 |
+| Reduction/normalization | RMSNorm、softmax、LayerNorm | 跨线程归约、数值稳定 | 用串行归约冒充生产实现 |
+
+社区文章中的 GEMM、MLA 或 RMSNorm 案例可以帮助理解工程取舍，但选题仍要回到你的 shape、
+dtype 和设备。不要因为文章展示了 H100 上的结果，就把同一 tile 作为其它 GPU 的默认值。
+
+## 14.2 写一页算子契约
+
+动手写 kernel 前，先完成下面这张表。任何空白都会在后面变成测试或集成问题。
+
+```text
+算子名称与数学定义：
+输入/输出 shape、stride 与布局：
+支持的 dtype 与累加 dtype：
+目标设备和 target：
+真实 shape 分布（不是只有一个点）：
+参考实现：
+数值容差与特殊值语义：
+必须覆盖的尾部、空输入和极小输入：
+现有生产路径与 fallback：
+kernel-only 和 end-to-end 计时边界：
+明确不支持的情况：
+```
+
+“支持动态 shape”不是一句布尔值。写清楚哪些维度运行时变化、哪些维度按 bucket 特化，
+以及新 shape 是否触发 JIT/autotune。若输入 stride 不连续，也要决定内核直接支持还是在
+wrapper 中先 contiguous；后者的复制成本必须计入端到端时间。
+
+## 14.3 建立参考实现和测试矩阵
+
+参考实现应优先表达数学语义，不追求与目标 kernel 相同的调度。测试矩阵至少包含：
+
+| 类别 | 示例 | 要验证什么 |
+|---|---|---|
+| 整除 | 所有维度整除 tile | 主数据流和计算公式 |
+| 尾部 | 每个主要维度分别余 1、余一半 | guard、padding、safe value、写回 |
+| 极小 | 1、2、7 等小尺寸 | 空循环、单 tile 和广播 |
+| 真实 | 从目标 workload 采样的 shape | dispatch 覆盖与实际收益 |
+| 数值 | 大小值、全零、重复 max、必要时 NaN/Inf | 累加、归约、mask 和容差 |
+| 布局 | 转置、非连续或 packed（若契约支持） | stride 与地址计算 |
+
+每个失败都应能回答：是索引错误、边界填充值错误、同步错误，还是浮点误差超过约定。先用
+最小 shape 和固定随机种子定位，不要直接在大模型输出上猜。
+
+```python
+# 这是测试结构示意，不绑定某个算子签名。
+for case in cases:
+    inputs = make_inputs(case, seed=0)
+    expected = reference(*inputs)
+    actual = tilelang_impl(*inputs)
+    torch.testing.assert_close(actual, expected,
+                               rtol=case.rtol, atol=case.atol)
+```
+
+如果算法依赖尾部 tile 填 0、`-inf` 或其它哨兵值，增加一个专门把边界中间值打印出来的
+测试。自动 guard 只能保证访问合法，不能替你证明填充值符合算法。
+
+## 14.4 写正确基线
+
+基线只做三件事：表达正确数据流、处理契约内边界、能够被测试。它可以使用保守的
+`T.serial`、显式 guarded copy 或较小 tile，但要把“为什么慢”写成可验证假设。
+
+提交基线时保留：
+
+- TileLang 源码和生成源码；
+- 测试矩阵结果；
+- kernel-only 延迟与端到端延迟；
+- 与参考库相同条件下的对照；
+- 一个初始 roofline/资源假设。
+
+如果基线比库慢很多，不要立即打开所有优化。先判断差距来自算法结构、访存、归约串行、
+没有使用目标矩阵指令、启动波次，还是 wrapper 中的额外复制。
+
+## 14.5 用证据选择两轮优化
+
+每轮优化只改变一个主要因素。可选方向包括：
+
+| 观察 | 可能的下一步 | 需要的新证据 |
+|---|---|---|
+| 全局搬运多、复用低 | 分块、shared、融合 | Analyzer 粗估 + 生成代码 + 带宽指标 |
+| 搬运等待明显 | `T.Pipelined`、调整 stages | 异步指令/等待位置、资源变化、延迟 |
+| shared bank 冲突 | padding 或 layout swizzle | 线程—元素图、bank 推导、profiler |
+| L2 局部性差 | rasterization、tile 顺序 | L2 指标与单开关实验 |
+| Tensor/矩阵单元未使用 | 检查 dtype、shape、scope、`T.gemm` policy | 生成指令与目标架构 |
+| 尾波或负载不均 | 改 tile、persistent、Stream-K 或分桶 | block 数、wave、归并成本 |
+| 搜索空间不确定 | 受约束 autotune | 非法配置过滤、固定输入、完整调优记录 |
+
+每轮记录采用同一模板：
+
+```text
+假设：
+只改变的变量：
+正确性结果：
+资源/生成代码变化：
+kernel-only 结果：
+end-to-end 结果：
+是否接受，为什么：
+下一步：
+```
+
+优化失败也是结果。若 layout swizzle 没有降低冲突或反而增加指令，就恢复基线，并说明这个
+访问模式不受益。不要为了让报告“全是正收益”而删除失败实验。
+
+## 14.6 公平比较库实现
+
+库对比必须满足相同语义和计时边界：
+
+- 输入、dtype、布局、mask、转置和输出精度一致；
+- 两边都完成 warmup，并使用相同 rep 和同步方式；
+- 分开报告第一次调用（含 JIT/autotune）与稳定态调用；
+- 分开报告 kernel-only 和 wrapper/pack/metadata/end-to-end；
+- 参考库自身可能 dispatch 到不同算法，记录实际版本与可观察路径。
+
+不要只展示赢的 shape。用矩阵列出所有目标 bucket：
+
+| shape bucket | TileLang | 参考库 | 相对效率 | 正确性 | dispatch 决策 |
+|---|---:|---:|---:|---|---|
+| 小尺寸 |  |  |  |  | library / TileLang |
+| 主工作负载 |  |  |  |  | library / TileLang |
+| 尾部尺寸 |  |  |  |  | library / TileLang |
+| 超出支持范围 | — |  | — | fallback | library |
+
+相对效率若定义为 `reference_latency / tilelang_latency`，数值大于 1 才表示 TileLang
+更快。表头或报告中写出定义，避免与吞吐比混淆。
+
+### 14.6.1 两道筛查：相对库 + roofline 锚点，缺一不可
+
+「对库比较」有一个隐藏的循环论证：PyTorch 既当基线、又当「好」的定义。因此
+"Correct but Slow" 研究（[arxiv 2607.04454](https://arxiv.org/abs/2607.04454)）提出用
+**两道互补筛查**一起判断内核是否真的高效：
+
+1. **可比较性筛查（相对基线）**：① 代表性形状上落在库的小因子范围内；② 大尺寸上至少
+   持平、最好更快（摊薄 launch/框架开销）；③ 没有任何 shape 出现灾难性坍缩。
+   它便宜且能立刻抓出慢两个数量级的内核，但无法鉴别「比一个本来就慢的基线快」的假赢。
+2. **roofline 锚点（锚定硬件，与基线无关）**：对内存受限内核取搬运字节数 W、对计算受限
+   内核取 FLOPs，`ρ = W / (t · P)`，P 为目标硬件峰值（HBM 带宽或 Tensor Core 吞吐）。
+   靠近屋顶就是高效，不管库做了什么；`ρ` 很低且优化后仍上不去，说明存在结构性残留。
+
+研究报告了两个用法要点：
+
+- 两道筛查在 `ρ ≈ 0.5` 附近会**分歧**：它测的 Softmax 与 GEMM 都在 GH200 上
+  `ρ = 0.47`，但 Softmax 相对库效率 0.87（可用），GEMM 只有 0.68（不合格）——
+  只有两个信号一起看才能定案；
+- **cliff（初始版到优化版的加速比）**是第三根轴：cliff 大且优化后 `ρ` 高 = 作者缺陷
+  已修复；cliff 大但 `ρ` 仍低 = 结构性上限（如它测的 Conv2d 修复 8.2× 后仍只到 0.28）。
+
+验收报告至少给出：相对效率、`ρ`、cliff 三者，并写明 W 的口径（字节数还是 FLOPs）与
+P 的来源（官方规格哪一项）。
+
+## 14.7 Dispatch、fallback 与集成
+
+真实系统不会因为某一个 shape 变快，就把所有请求交给同一个 kernel。wrapper 至少检查：
+
+```text
+target/device 是否匹配？
+dtype 和布局是否支持？
+shape 是否落在已经测试并调优的 bucket？
+所需架构原语是否可用？
+输出语义和容差是否满足调用方？
+否则是否安全回退到参考库？
+```
+
+把最佳配置与适用键一起保存，例如 `(device_arch, dtype, layout, shape_bucket, tilelang_version)`。
+版本升级后先跑回归测试和小规模 benchmark，再复用旧配置。缓存命中不等于二进制和性能跨
+版本稳定。
+
+如果集成到训练或推理框架，还要检查：
+
+- stream 和异步调用语义；
+- autograd/反向是否实现，或是否明确只支持 inference；
+- 张量别名、原地写和生命周期；
+- 多 GPU/多进程下的编译缓存与设备选择；
+- 错误信息是否能指出不支持的 shape，而不是静默给错结果。
+
+## 14.8 最终验收
+
+| 类别 | 通过条件 |
+|---|---|
+| 契约 | shape、dtype、布局、设备、数值语义和不支持范围写清楚 |
+| 正确性 | 整除、尾部、极小、真实和数值边界全部通过 |
+| 可复现 | 环境、依赖、target、随机种子和运行命令齐全 |
+| 性能 | 同条件库对比 + roofline 锚点（ρ）与 cliff 三件齐全，包含 kernel-only、end-to-end 和首次/稳定态 |
+| 归因 | 至少两轮单变量实验，有生成代码或 profiler 证据，根因能对号入座到第 09 章的 RC 分类 |
+| 工程 | dispatch 与 fallback 明确，版本升级有回归方法 |
+| 表达 | 结论带条件，不把单设备、单 shape 的结果写成普遍规律 |
+
+任何一项缺失，都不应声称“可替换生产实现”。如果最终结论是“目标 shape 上库更快”，但你
+已经定位差距、保存测试和确定停止条件，这仍是合格的 Capstone。
+
+## 14.9 Checkpoint
+
+提交以下产物：
+
+1. 一页算子契约和资料来源表；
+2. 可运行的参考实现、TileLang 基线和测试矩阵；
+3. 基线、两轮优化、参考库的统一性能表；
+4. 一份生成代码、IR trace、Analyzer 或 Nsight 证据，并说明它支持什么判断；
+5. dispatch/fallback 规则和不支持范围；
+6. 一页复盘：做对了什么、哪次假设失败、如果再做一周会先验证什么。
+
+## 口述自测
+
+1. 为什么你的算子值得自定义，而不是直接使用库？
+2. 哪些 shape 会进入 TileLang 路径，哪些必须 fallback？
+3. 最危险的正确性边界是什么？你怎样构造反例？
+4. 两轮优化分别改变了什么，证据如何支持归因？
+5. 第一次调用与稳定态延迟为什么要分开？
+6. 如果升级 TileLang 或更换 GPU，哪些结论必须重新验证？

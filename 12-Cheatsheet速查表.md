@@ -41,7 +41,7 @@ def add(N: int, block: int = 256, dtype: str = 'float32'):
 | `T.Parallel(e0, e1, ...)` | 并行循环 | elementwise/拷贝；给编译器并行化/向量化机会 |
 | `T.Pipelined(n, num_stages=k)` | 软件流水线 | GEMM/FA 主循环标配 |
 | `T.Persistent(...)` | 持久化 block | 高级模板 |
-| `T.while` / `break` / `continue` | 控制流 | 条件须为 TIR 表达式 |
+| Python `while` / `break` / `continue` | 控制流 | 条件须能转成 TIR 表达式 |
 | `T.all_of / T.any_of` | 多条件 | 边界判断用 |
 
 ### 内存分配
@@ -69,7 +69,7 @@ def add(N: int, block: int = 256, dtype: str = 'float32'):
 
 | API | 说明 |
 |---|---|
-| `T.gemm(A_s, B_s, C_f, transpose_A/B=False, policy=...)` | tile GEMM → Tensor Core；A/B 需 shared，C 需 fragment |
+| `T.gemm(A_s, B_s, C_f, transpose_A/B=False, policy=...)` | tile GEMM；具体矩阵指令、scope 和 shape 约束取决于 target。**fp32 输入在 SM80 上可能静默降为 TF32**，严格精度报告需确认实际执行精度 |
 | `T.gemm_sp(...)` | 2:4 稀疏 |
 | `T.reduce_sum/max/min(acc_s, dst, dim=1, clear=False)` | 片段归约到行/列 |
 | `T.cumsum / T.cummax` | 扫描 |
@@ -138,7 +138,7 @@ p.assert_allclose(ref_fn, rtol=1e-2, atol=1e-2)                # 校验
 
 | 参数 | 取值 |
 |---|---|
-| `target` | `'auto' \| 'cuda' \| 'hip' \| 'metal'` |
+| `target` | `'auto' \| 'cuda' \| 'hip' \| 'metal' \| 'llvm' \| 'webgpu' \| 'c' \| 'cutedsl'` |
 | `execution_backend` | `'auto' \| 'tvm_ffi' \| 'cython' \| 'nvrtc' \| 'torch'` |
 | `out_idx` | 输出参数下标；`[-1]` 最后一个；多输出返回元组 |
 | `pass_configs` | e.g. `{tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}` |
@@ -147,7 +147,8 @@ p.assert_allclose(ref_fn, rtol=1e-2, atol=1e-2)                # 校验
 
 ```python
 # 速查模板：A/B/C 都是二维 tile GEMM 的输入输出，具体 shape 在 prim_func 中声明。
-@tilelang.autotune(configs=configs_fn, warmup=25, rep=100, timeout=60)
+@tilelang.autotune(configs=configs_fn, warmup=25, rep=100, timeout=60,
+                   early_stop=False)
 @tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M=128, block_N=128, block_K=32,
            threads=128, num_stages=3, dtype='float16', accum_dtype='float32'):
@@ -190,19 +191,22 @@ with set_autotune_inputs(A, B, C):
 | `TILELANG_AUTO_TUNING_CPU_COUNTS` 等 | autotune 并行度控制 |
 | `TVM_ROOT` / `WITH_PIP_CUDA_TOOLCHAIN` | 构建期 |
 
-## 6. GPU 硬件常数参考（仅作查找入口，随型号变化）
+## 6. 目标硬件记录项
 
-| 项目 | A100 | H100 SXM | RTX 4090 |
-|---|---|---|---|
-| HBM 带宽 | ~2.0 TB/s | ~3.35 TB/s | ~1.0 TB/s |
-| FP16 Tensor 峰值 | ~312 TFLOPS | ~990 TFLOPS | ~330 TFLOPS |
-| FP8 Tensor 峰值 | — | ~1979 TFLOPS | — |
-| 共享内存/block | 48KB 默认，可上探 ~164KB | 类似（Hopper 227KB 动态） | 48KB 默认，~100KB 动态 |
-| warp 大小 | 32 线程 | 32 | 32 |
-| SM bank 数 | 32（4B/bank） | 32 | 32 |
-| 最大线程/block | 1024 | 1024 | 1024 |
+硬件数字会随型号、形态、功耗配置和精度口径变化，速查表不保存一份容易过期的峰值副本。
+每次实验从目标 GPU 的官方规格和运行时查询下列字段：
 
-> 表格中的数字只用于提醒你需要查目标 GPU 的官方规格；不要直接用它们验收本地性能。
+| 类别 | 要记录什么 |
+|---|---|
+| 身份 | GPU 型号、compute capability/target arch、设备数量 |
+| 软件 | 驱动、CUDA/ROCm、TileLang、PyTorch、编译后端 |
+| 计算 | 目标 dtype 下的 dense/sparse 峰值口径，是否含 sparsity |
+| 内存 | 显存类型与带宽、L2 容量、每 SM/block 可用 shared memory |
+| 执行 | warp/wavefront 宽度、最大线程/block、寄存器和 occupancy 限制 |
+| 测量 | 实际时钟/功耗状态、warmup、rep、计时 backend |
+
+HBM/GDDR 是显存的物理实现，不是 CUDA 代码中的独立通用作用域。代码和数据流图使用
+global/device memory，性能报告再注明物理显存类型。
 
 ## 7. 常见报错与解决
 
@@ -211,10 +215,23 @@ with set_autotune_inputs(A, B, C):
 | `Ramp of more than 4 lanes is not allowed` | 向量化宽度过宽（8 lane）；检查 T.copy/T.Parallel 的宽度提示或改布局 |
 | shared memory 超限 | tile×stages 太大；降 BK/stages 或 tile |
 | `T.gemm` 布局不匹配报错 | A_s/B_s/C_f 布局冲突；`annotate_layout` 显式指定 |
-| 结果错在边界 tile | 越界读写或尾部 tile 未零填充；输出用 guard，GEMM 输入明确 padding |
+| 结果错在边界 tile | 越界读写或尾部 tile 未零填充；输出用 guard，GEMM 输入明确 padding。若依赖哨兵值填充：直接打印边界 tile 内容，并 grep 生成源码里是否出现该常量（历史 issue #2543：whole-tile `T.copy` 曾静默忽略 `annotate_safe_value`） |
 | `async_copy` 结果错 | 忘了 `T.ptx_wait_group`；或屏障时机不对 |
 | autotune "No configurations" | configs 为空/过滤过头；检查生成器 |
 | 动态形状 autotune 报错 | 内置生成器需静态形状；改用 `set_autotune_inputs` |
+| 归约类算子正确但极慢 | 很可能用了 `T.serial` 归约：换 `T.reduce`，再用 Nsight 看 `warp_stall_long_scoreboard` 是否归零 |
+
+### 工具选择
+
+| 目标 | 第一工具 |
+|---|---|
+| 无 GPU 检查生成路径 | `python -m tilelang.tools.compile_only` |
+| 查看 pass 首次改变 IR 的位置 | `TL_LOWER_TRACE=html` |
+| 缩小稳定失败程序 | `python -m tilelang.autodd` |
+| 查看线程—元素布局 | `tilelang.tools.plot_layout` |
+| 估算已识别 GEMM FLOPs/全局 copy 字节 | `tilelang.tools.Analyzer` |
+| CUDA 越界/竞态 | Compute Sanitizer |
+| 时间线/单 kernel 指标 | Nsight Systems / Nsight Compute |
 
 ## 8. 面试 30 秒自我介绍稿（模板）
 
@@ -225,5 +242,5 @@ with set_autotune_inputs(A, B, C):
 
 ---
 
-*全课程到这里结束。祝你面试顺利——记住：数据、对照、归因，永远是内核工程师的
-三个关键词。*
+速查结束后回到第 14 章完成 Capstone。只有代码、测试、测量、归因和适用范围同时齐全，
+这个内核才算达到课程验收标准。
