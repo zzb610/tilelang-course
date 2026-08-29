@@ -34,6 +34,11 @@ O = P @ V                  # [B,H,N,d]
 **IO 浪费**：softmax 的归一化分母需要看到整行，所以 `Q@K^T` 的结果必须先写回 HBM，
 `P@V` 时再读回来——**同一份中间数据被存取两遍**。
 
+讲到这两个问题时，先停下，亲手把代价算一遍，因为它们一出来就是致命的。拿这串数字跟手算
+对一下：`N²` 个元素，一半存成 fp16（每元素 2 字节），一个头就是 `32K×32K×2B = 2 GiB`，
+和上面那句「单头约 2 GiB」正好对上。至于 IO，softmax 的分母要等整行到齐，于是中间结果先
+写回 HBM、`P@V` 时再读回来，你等于付了两次全局内存往返，却只是在来回捎带同一个数字。
+
 换句话说，朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量本身是 O(N²·d)。FlashAttention
 的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护「部分归一化」，不把完整
 S/P 落盘。需要精确一点的是，它并非把所有 Attention 的 HBM IO 变成 O(N)——更准确的 IO 上界
@@ -65,6 +70,11 @@ l_new   = l_prev · exp(m_prev − m_new) + l_local · exp(m_local − m_new)
 关键还要处理输出：因为归一化的分母换了，老块的每个输出行向量 `O_prev` 都要乘上
 `exp(m_prev − m_new)`。推导一句话概括：**归一化变了，分母换了，旧的分子乘上「换分母的
 修正因子」就行**——不用重读任何东西。
+
+这个公式乍一看像变戏法——明明来了一个新的分数块，凭什么只要乘一个标量就齐了？先承认
+这个反直觉，再落回代数：softmax 的分子是 `exp(s_j − m)`，分母换成新最大值后，每个老分子
+都要乘上 `exp(m_0ld − m_new)` 才能保持比值不变。看起来玄乎，其实它只是把「换分母」这件
+事写出来了，没有别的新东西。
 
 在 TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做的工作正好对应上面三步：
 
@@ -392,8 +402,12 @@ O_unpad[q_pack, h, d] = 第 b 条序列的输出 O[i, h, d]
 
 在得到 `q_start`、`k_start` 后，普通 FlashAttention 的两层循环仍然保留，只是全局
 切片从 `bx * block_M` 改成 `q_start + bx * block_M`，从 `k * block_N` 改成
-`k_start + k * block_N`。网格的 query 方向使用 `max_seqlen_q` 作为上界，而不是
-把所有样本都错误地当成 `max_seqlen_q` 长度。
+`k_start + k * block_N`。你可能会问：为什么不直接比较 `q_local` 和 `k_local`，非要多加
+一层 `q_start`/`k_start` 偏移？因为 `q_local` 和 `k_local` 都只是「本样本内部」的局部坐标，
+一旦多条样本 packed 进同一块连续内存，局部坐标相同的两个位置在物理地址上根本不在同一条
+序列里——不借助前缀和把局部坐标抬到 packed 全局坐标，后面的掩码判断就会漏掉别的样本。
+网格的 query 方向使用 `max_seqlen_q` 作为上界，而不是把所有样本都错误地当成
+`max_seqlen_q` 长度。
 
 ### 6.5.4 TileLang 内核骨架：偏移量放在哪里
 
@@ -555,7 +569,11 @@ q_local >= k_local
 ```
 
 但在推理 decode 中，query 可能只有最近的 `Lq` 个 token，而 K/V 已经包含 `Lk` 个历史
-token，此时直接比较局部坐标会把 query 错误地当成从序列开头开始。常见的右对齐语义是：
+token，此时直接比较局部坐标会把 query 错误地当成从序列开头开始。你难免会问：既然只是
+比较两个局部坐标，为什么长度一变就失效了？因为 `q_local >= k_local` 暗中假设 query 和
+key 从同一个位置起算；一旦 `Lq != Lk`，query 已经被右对齐到 KV 尾部，它的局部下标 0
+对应的是完整序列里的 `offset` 位置，不先加上这个偏移，比较就落到了错误的锚点上。常见的
+右对齐语义是：
 
 ```text
 offset = Lk - Lq
@@ -578,7 +596,10 @@ offset = Lk - Lq
 
 ### 6.5.6 如何验证：先按序列比较，再比较 packed 输出
 
-不要把所有 packed token 直接和一个 padded Attention 结果比较。正确做法是：
+看到 packed 张量，你多半会想问：为什么不干脆把所有 token 拼起来，跟一个 padded
+Attention 的结果直接比？因为 padded reference 会把 padding token 也当成有效位置算进
+softmax 的分母，而正确的 varlen 里不同样本之间、以及 padding 位置都不该互相「看见」。
+如果混在一起比，你连错了哪条序列都看不出来。正确做法是：
 
 1. 为每条样本分别生成 Q/K/V 和 dense reference；
 2. 在每条样本内部完成 causal/non-causal Attention；
@@ -697,6 +718,9 @@ Attention 配对利用率 = 37 / 50 = 74%
 
 一篇社区工程文章（[Writing High-Performance Kernels in TileLang, from GEMM to MLA](https://huggingface.co/blog/AtlasCloud-AI/writing-high-performance-kernels-in-tilelang)）
 把 MLA 讲成了本章概念的总复习，核心难点不是数学而是**寄存器预算**：
+
+读完你会发现，踩坑的人一开始并没在数学上卡住，而是先撞进了一道墙——手上没有那么多
+寄存器可用：
 
 1. **形状**：MLA 的 query/key 宽 576（512 的 no-pe 部分 + 64 的 rope 部分）、value 宽 512，
    所以输出累加器 `acc_o = [block_M, 512]` 必须在整个 KV 循环期间常驻寄存器。

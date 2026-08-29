@@ -1,17 +1,19 @@
 # 第 13 章 分组 GEMM：从多个小矩阵到 MoE 内核
 
-普通 GEMM 的规则性给了我们一个舒适前提：每个 block 都处理同样大小的输出 tile。MoE
-打破了这个前提。token 被路由到不同 expert 后，各组的行数随输入变化；有的组很大，有的组
-很小，甚至为空。乘法公式没有改变，工作量的分布却不再规则。
+第 05 章的 GEMM 一直活在一个舒适前提里：每个 block 都处理同样大小的输出 tile。MoE
+打破了这个前提。token 被路由到不同 expert 后，各组的行数随输入起伏——有的组很大，有的
+组很小，甚至为空。乘法公式一个字都没变，工作量的分布却不再规则。这种「看起来一样的活，
+分到手却有人多有人少」的错位，正是这一章要面对的问题。
 
-这使 Grouped GEMM 的主要困难从“怎样做矩阵乘”转移到“怎样表示和调度一组不同大小的矩阵
-乘”。packed layout 决定数据如何连续存放，前缀和描述每组的边界，block 映射把线性工作编号
-还原为 group 与 tile 坐标。第 05 章的 shared、fragment、流水线和 `T.gemm` 仍在内层发挥
-作用，只是外面多了一层不规则映射。
+于是 Grouped GEMM 的主要困难从「怎样做矩阵乘」转移到「怎样表示和调度一组不同大小的矩阵
+乘」：packed layout 决定数据如何连续存放，前缀和描述每组的边界，block 映射把线性工作编号
+还原为 group 与 tile 坐标。第 05 章的 shared、fragment、流水线和 `T.gemm` 仍在内层照常
+工作，只是外面多套了一层不规则映射。
 
-本章通过一个具体的小组分布逐步建立这层映射，再讨论 padding、空组、分桶和端到端 MoE
-开销。文中的 `group_idx_for_block` 是这种映射的一份元数据，不是 TileLang 保证存在的固定
-API。这个区别也提醒我们：工程设计首先来自工作负载的结构，而不是来自可调用的函数名。
+本章通过一个具体的小组分布逐步把这层映射搭起来，再讨论 padding、空组、分桶和端到端 MoE
+开销。顺带提醒一个容易踩空的点：文中的 `group_idx_for_block` 是这份映射的一份元数据，不是
+TileLang 保证存在的固定 API。这个区别本身有味道——工程设计首先来自工作负载的结构，而不是
+来自某个可调用的函数名。
 
 > **本章导航** 高级专项难度，预计 4–6 小时。前置是第 05 章 GEMM、第 07 章布局与高级
 > 指令、第 08 章自动调优。运行范围以 CUDA GPU 为主线，完整性能实验需要支持 `T.gemm`
@@ -47,6 +49,8 @@ expert 1: A1[128,4096]  × B1[4096, 11008] → C1[128, 11008]
 expert 2: A2[7, 4096]   × B2[4096, 11008] → C2[7, 11008]
 expert 3: A3[64, 4096]  × B3[4096, 11008] → C3[64, 11008]
 ```
+
+把这四个 expert 摆在一起，你立刻能感觉到那种不均：最小的组只有 7 个 token，最大的组有 128 个 token，差了近 20 倍。轮到 expert 2 时，7 个 token 的矩阵乘根本喂不满 GPU，调度的开销和尾部的浪费反而成了主角。
 
 如果逐组调用 GEMM，就会产生 4 次 kernel 调度；如果每组很小，矩阵乘本身的并行度不足，调度开销和尾部浪费会更加明显。分组 GEMM 的目标是：**保留每组独立的矩阵和结果语义，同时让多个组共享一套 kernel 调度和 tile 逻辑。**
 
@@ -186,7 +190,7 @@ def grouped_gemm_separate_launches(A_pack, B_stack, row_offsets):
 
 ## 13.4 最关键的难点：把 block 映射回 group
 
-普通 GEMM 中，`blockIdx.x/y` 可以直接解释为输出 tile 的列/行坐标。Grouped GEMM 中，一个线性 block id 还需要知道它属于哪一组。
+普通 GEMM 中，`blockIdx.x/y` 可以直接解释为输出 tile 的列/行坐标。Grouped GEMM 中，一个线性 block id 还需要知道它属于哪一组。你可能第一反应是问：为什么不直接把 `blockIdx` 当作 tile 坐标来算？因为在分组场景里，这个 block 到底落在哪一组的第几行第几列，已经不是从坐标里「算」出来的东西，而是从组大小推导出来的信息——这正是本节的难点所在。
 
 ### 13.4.1 用每组 tile 数建立前缀和
 
@@ -539,6 +543,8 @@ TFLOPS = 2 * sum(M_g * K * N) / latency_ms / 1e9
 
 ## 13.10 调试清单
 
+切身体会过的人都知道，grouped GEMM 出错的第一现场多半不是矩阵乘算错，而是「这个 block 到底是谁」没对上。下面这份清单按「先元数据、后小 case、再 print」的顺序排，每一步都在把问题的范围缩小，而不是把排查做得更花哨。
+
 ### 13.10.1 先在 host 侧检查元数据
 
 ```python
@@ -562,7 +568,7 @@ def check_group_metadata(group_sizes, row_offsets, padded_offsets, group_idx_for
     assert block_groups.numel() == expected_blocks.item()
 ```
 
-这一步能先排除大量 GPU kernel 问题：offset 长度不对、block 数不对、group id 越界、空组处理不一致，都应该在 host 侧直接失败。
+这一步能先排除大量 GPU kernel 问题：offset 长度不对、block 数不对、group id 越界、空组处理不一致，都应该在 host 侧直接失败。把它们留到 GPU 上再去查，一个报错可能让你在几千个 block 里来回翻，而这里的每个 assert 都只要一行报错就把范围锁死。
 
 ### 13.10.2 再检查三个最小 case
 
@@ -570,11 +576,11 @@ def check_group_metadata(group_sizes, row_offsets, padded_offsets, group_idx_for
 2. `G=2` 且 `M=[BM, 1]`：专门检查第二组尾部；
 3. `G=3` 且 `M=[0, 7, 2*BM+1]`：检查空组、中间组和大组同时出现。
 
-如果 `G=1` 都不正确，先不要调 grouped mapping；如果 `G=1` 正确而 `G>1` 错误，优先打印 `group_id`、`group_row0`、`output_row0` 和 `valid_m`。
+如果 `G=1` 都不正确，先不要调 grouped mapping；如果 `G=1` 正确而 `G>1` 错误，优先打印 `group_id`、`group_row0`、`output_row0` 和 `valid_m`。这个「从最小配置起、一次加一种复杂度」的顺序，能把问题干净地切成「tile 本身写错」和「映射层写错」两类，而不是让你在两个嫌疑之间来回怀疑自己。
 
 ### 13.10.3 `T.print` 的打印对象
 
-调试输入缩小后，每个 M block 只打印一次：
+如果前面两步都没拦住问题，才轮到 `T.print` 出场。调试输入缩小后，每个 M block 只打印一次：
 
 ```text
 bm_id, group_id, group_row0, output_row0, valid_m
