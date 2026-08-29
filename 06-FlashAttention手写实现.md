@@ -1,24 +1,25 @@
 # 第 06 章 FlashAttention 手写实现
 
-> **本章目标**：先从朴素 Attention 的存储问题出发，推导在线 softmax，再把公式映射到
-> 两个 tile GEMM 和一个分块循环。学习重点是「为什么这样更新仍然等价」，而不是先背
-> 一份长代码；代码验证通过后，再讨论 IO、反向重计算和变体。
+第 05 章我们学会了把矩阵乘切成 tile、交给 `T.gemm` 高效执行，但 GEMM 只是骨架：真实的
+Transformer 里，最昂贵的算子往往是注意力。从朴素 Attention 的存储问题出发，我们要推导
+出在线 softmax，再把公式映射到两个 tile GEMM 和一个分块循环上。这一章的学习重点不是背下
+一份长代码，而是理解「为什么这样更新仍然等价」；代码验证通过后，再讨论 IO、反向重计算和
+变体。
 
-**学习信息**
+> **本章导航** 高级难度，预计 5–8 小时；前置是第 03～05 章里关于分块 GEMM、归约、mask
+> 和 fp16/fp32 混合精度的知识。完整前向示例需要支持 `T.gemm`/fragment 的 GPU，请先用
+> 小尺寸做正确性，不要直接运行大尺寸参考实现。学完你会留下 online softmax 的推导、一份
+> 小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。参考：[官方 FlashAttention examples](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention)、
+> [DeepSeek MLA 文档](https://tilelang.com/deeplearning_operators/deepseek_mla.html) 和
+> [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
 
-- 难度：高级；预计用时：5–8 小时；
-- 前置：第 03～05 章，理解分块 GEMM、归约、mask 和 fp16/fp32 混合精度；
-- 运行范围：完整前向示例需要支持 `T.gemm`/fragment 的 GPU；先用小尺寸做正确性，不要直接运行大尺寸参考实现；
-- 本章产出：online softmax 推导、一份小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。
-- 参考：[官方 FlashAttention examples](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention)、
-  [DeepSeek MLA 文档](https://tilelang.com/deeplearning_operators/deepseek_mla.html) 和
-  [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
-
-**阅读路线：**先把 `S → P → O` 的数据形状写清楚；再只学习 `(m, l, O)` 三个在线状态；
-随后逐段阅读实现；最后分开做「整除尺寸正确性」和「尾部尺寸设计」。不要把 dense reference
-能否运行、kernel 是否正确、kernel 是否高效混成一个问题。
+阅读时建议先把 `S → P → O` 的数据形状写清楚，再只学习 `(m, l, O)` 三个在线状态，随后
+逐段阅读实现，最后分开做「整除尺寸正确性」和「尾部尺寸设计」。途中要始终分清三个不同的
+问题：dense reference 能否运行、kernel 是否正确、kernel 是否高效——它们各自有各自的判据。
 
 ## 6.1 朴素 Attention 为什么慢
+
+先看朴素 Attention 的三行定义，它直接暴露出问题所在：
 
 ```text
 S = Q @ K^T / sqrt(d)      # [B,H,N,N]，N² 张量
@@ -26,44 +27,44 @@ P = softmax(S, dim=-1)     # 需要整行才能归一化！
 O = P @ V                  # [B,H,N,d]
 ```
 
-两个致命问题：
+这段计算有两个致命问题，而且彼此关联。第一个问题是**显存爆炸**：`S` 和 `P` 都是 `N×N`，
+序列 32K 时单头仅一个 fp16 中间张量就约 2 GiB，多头和多 batch 还会更快放大。第二个问题是
+**IO 浪费**：softmax 的归一化分母需要看到整行，所以 `Q@K^T` 的结果必须先写回 HBM，
+`P@V` 时再读回来——**同一份中间数据被存取两遍**。
 
-1. **显存爆炸**：`S` 和 `P` 都是 `N×N`，序列 32K 时单头仅一个 fp16 中间张量就约
-   2 GiB；多头/多 batch 更快放大；
-2. **IO 浪费**：softmax 的归一化分母需要看到整行，所以 `Q@K^T` 的结果必须先写回
-   HBM，`P@V` 时再读回来——**同一份中间数据被存取两遍**。
+换句话说，朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量本身是 O(N²·d)。FlashAttention
+的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护「部分归一化」，不把完整
+S/P 落盘。需要精确一点的是，它并非把所有 Attention 的 HBM IO 变成 O(N)——更准确的 IO 上界
+依赖片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
 
-朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量是 O(N²·d)。FlashAttention
-的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护「部分归一化」，不把
-完整 S/P 落盘。它不是把所有 Attention 的 HBM IO 变成 O(N)；更准确的 IO 上界依赖
-片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
-
-核心结论是：FlashAttention 减少了 HBM 往返，并避免把完整的 `S/P` 中间矩阵落盘；它
-是否更快、是否受访存限制，仍取决于序列长度、head_dim、GPU、实现和 profiler 结果。
+于是核心结论落在这里：FlashAttention 减少了 HBM 往返，并避免把完整的 `S/P` 中间矩阵落盘；
+但它是否更快、是否受访存限制，仍取决于序列长度、head_dim、GPU、实现和 profiler 结果。
 
 ## 6.2 在线 softmax：数学推导（必会）
 
-对一行 logits `s_1..s_N`，softmax 需要 `m = max s_j` 和 `l = Σ exp(s_j − m)`。
+对一行 logits `s_1..s_N`，softmax 需要两个量：`m = max s_j` 和 `l = Σ exp(s_j − m)`。
+当整行都可见时这很直观，可一旦要分块处理，就必须回答「如何在只看到部分数据时仍然维护
+等价的分母与分子」。
 
-分块处理：假设已处理前 `t` 块，维护：
+分块处理的思路是：假设已处理前 `t` 块，维护两个状态：
 
 ```text
 m_prev = 当前 max（前 t 块）
 l_prev = 当前 exp 和（已用 m_prev 归一）
 ```
 
-来了新块，局部统计 `m_local`、`l_local`。合并公式：
+现在来了一个新块，它有自己的局部统计 `m_local`、`l_local`。合并公式给出了迁移规则：
 
 ```text
 m_new   = max(m_prev, m_local)
 l_new   = l_prev · exp(m_prev − m_new) + l_local · exp(m_local − m_new)
 ```
 
-输出也要重缩放：老块的每个输出行向量 `O_prev` 乘 `exp(m_prev − m_new)`。
-推导一句话：**归一化变了，分母换了，旧的分子乘上「换分母的修正因子」就行**——不用
-重读任何东西。
+关键还要处理输出：因为归一化的分母换了，老块的每个输出行向量 `O_prev` 都要乘上
+`exp(m_prev − m_new)`。推导一句话概括：**归一化变了，分母换了，旧的分子乘上「换分母的
+修正因子」就行**——不用重读任何东西。
 
-TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做：
+在 TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做的工作正好对应上面三步：
 
 ```python
 # 先保存旧 max，再算新 max
@@ -97,7 +98,8 @@ for i, j in T.Parallel(block_M, dim):
 
 ## 6.3 TileLang 实现：完整代码
 
-以下代码精简自官方示例（去掉 autotune 装饰器，便于学习；`@tilelang.jit` 保留）。为了
+有了上述状态迁移公式，下面的代码只是把这些状态落到 fragment 上。以下代码精简自官方示例
+（去掉 autotune 装饰器，便于学习；`@tilelang.jit` 保留）。为了
 让主线先聚焦算法，代码先以整除 tile 的小尺寸为验证目标；尾部 query/KV tile 的 guard、
 padding 和输出写回需要在通过主线后单独补齐。
 
@@ -209,6 +211,9 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 
 ### 6.3.1 逐段解读
 
+把上面的代码拆成片段，每一段都能对应到一个我们已经讲过的概念。这张表回答「每块代码在
+算法里扮演什么角色、有什么关键点」，适合在读完代码后逐行回看：
+
 | 片段 | 作用 | 关键点 |
 |---|---|---|
 | 网格 `(seq/block_M, heads, batch)` | 一个 block 处理 `block_M` 个 query | `bz` 是 batch、`by` 是头 |
@@ -220,6 +225,9 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
 | 收尾 `/= logsum` | 最后除一次 | 全程只有一次除法 |
 
 ### 6.3.2 运行与验证
+
+代码写完后，第一步永远是正确性。先用整除 tile 的小尺寸验证，dense reference 会显式创建
+N×N scores，不能任意放大 N：
 
 ```python
 # 先用整除 tile 的小尺寸做正确性；dense reference 会显式创建 N×N scores，不能任意放大 N。
@@ -247,11 +255,12 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 
 ## 6.4 反向传播：为什么「重计算」
 
-反向需要 `P` 和 `S`，但前向从不落盘。FlashAttention 的做法（官方 bwd 示例
-`example_mha_bwd_bshd.py` 等）：**反向时用同样的分块循环重算 S/P**（用保存的
-`logsum` 或 `lse`），再算 `dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于
-实现和融合方式，换来 O(N²) 中间张量的显存节省与更少的 HBM 往返——在长序列上通常值得。
-解释反向时，应同时说明重计算、显存占用和实际运行时间之间的权衡。
+前向为了省显存而不落盘 `S` 和 `P`，反向却恰恰需要 `P` 和 `S` 来求 `dV、dK、dQ`，这个
+矛盾是理解反向的起点。FlashAttention 的做法（官方 bwd 示例 `example_mha_bwd_bshd.py`
+等）是：**反向时用同样的分块循环重算 S/P**（用保存的 `logsum` 或 `lse`），再算
+`dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于实现和融合方式，换来 O(N²) 中间
+张量的显存节省与更少的 HBM 往返——在长序列上通常值得。因此解释反向时，应同时说明重计算、
+显存占用和实际运行时间之间的权衡，而不是只讲其中一面。
 
 ## 6.5 变长序列（varlen）：从 padding 到 packed layout
 
@@ -259,12 +268,11 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 同一个 batch 里的句子长度可能分别是 4096、1732、287，若仍然把它们补齐到 4096，
 Attention 会对大量 padding token 做无效计算。
 
-varlen 的核心是改变输入的**存储布局和索引方式**，Attention 公式本身不变：
-
-1. 去掉每条序列末尾的 padding，把有效 token 沿序列维拼接成一块；
-2. 用 `cu_seqlens` 记录每条序列在这块连续内存中的起止偏移；
-3. kernel 仍然按「一个 batch 样本 + 一个 query tile」计算，但通过偏移量找到该样本自己的 Q/K/V；
-4. 最终输出仍按 packed 顺序写回，必要时再由宿主函数恢复成 padded layout。
+varlen 的核心是改变输入的**存储布局和索引方式**，Attention 公式本身不变。具体是四步：
+首先去掉每条序列末尾的 padding，把有效 token 沿序列维拼接成一块；其次用 `cu_seqlens`
+记录每条序列在这块连续内存中的起止偏移；然后 kernel 仍然按「一个 batch 样本 + 一个 query
+tile」计算，但通过偏移量找到该样本自己的 Q/K/V；最后输出仍按 packed 顺序写回，必要时再由
+宿主函数恢复成 padded layout。
 
 官方示例可参考 [example_mha_fwd_varlen.py](https://github.com/tile-ai/tilelang/blob/main/examples/flash_attention/example_mha_fwd_varlen.py)
 和 [varlen_utils.py](https://github.com/tile-ai/tilelang/blob/main/examples/flash_attention/varlen_utils.py)。
@@ -273,7 +281,7 @@ varlen 的核心是改变输入的**存储布局和索引方式**，Attention �
 
 ### 6.5.1 为什么要从 dense 改成 packed
 
-等长版本的张量通常是：
+先看等长版本占用多少「无用的空间」。等长版本的张量通常是：
 
 ```text
 Q: [B, Nq, H, D]       # 所有样本都按同一个 Nq 分配
@@ -354,9 +362,9 @@ cu_q = make_cu_seqlens([5, 3], device="cuda")  # shape: [3]，值为 [0, 5, 8]
 cu_k = make_cu_seqlens([5, 4], device="cuda")  # shape: [3]，值为 [0, 5, 9]
 ```
 
-需要同时满足：`cu_seqlens[0] = 0`、单调不减、最后一个元素等于 packed token 总数，
-并且通常使用 `int32` 且放在和 Q/K/V 相同的设备上。长度为 0 的样本可以存在，
-但必须提前决定它的输出语义；教学实现一般先用正长度样本验证，再补零长度边界。
+构造时需同时满足：`cu_seqlens[0] = 0`、单调不减、最后一个元素等于 packed token 总数，
+并且通常使用 `int32` 且放在和 Q/K/V 相同的设备上。长度为 0 的样本可以存在，但必须提前
+决定它的输出语义；教学实现一般先用正长度样本验证，再补零长度边界。
 
 ### 6.5.3 从 dense 坐标到 packed 坐标
 
@@ -689,9 +697,9 @@ Attention 配对利用率 = 37 / 50 = 74%
 把 MLA 讲成了本章概念的总复习，核心难点不是数学而是**寄存器预算**：
 
 1. **形状**：MLA 的 query/key 宽 576（512 的 no-pe 部分 + 64 的 rope 部分）、value 宽 512，
-  所以输出累加器 `acc_o = [block_M, 512]` 必须在整个 KV 循环期间常驻寄存器。
+   所以输出累加器 `acc_o = [block_M, 512]` 必须在整个 KV 循环期间常驻寄存器。
 2. **硬件约束**：Hopper 的 `wgmma.mma_async` 把 4 个 warp（128 线程）绑成一个 warpgroup，
-  且要求 M ≥ 64。于是一个 warpgroup 至少要持有 64×512 的累加器——放不下，寄存器溢出后性能断崖。
+   且要求 M ≥ 64。于是一个 warpgroup 至少要持有 64×512 的累加器——放不下，寄存器溢出后性能断崖。
 3. **解法**：`T.gemm` 的 `policy=T.GemmWarpPolicy.FullCol` 把输出沿 dim 维切给两个
    warpgroup（各持 64×256），同时该 policy 把约束**反向传播**：`P@V` 的每个 warpgroup
    需要完整的 `acc_s`，于是 staging buffer `S_shared` 也必须是 `[BM, BN]`，而 `Q@K` 阶段
@@ -727,20 +735,23 @@ Attention 配对利用率 = 37 / 50 = 74%
 tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接近的官方测试文件出发，再
 保留自己的 reference 和 edge cases。
 
-## 6.6 本章小结
+## 6.6 本章回顾
 
-- 朴素 Attention 慢在 **N² 中间张量的 HBM 往返**；FA 用**分块 + 在线 softmax**
-  避免完整 S/P 落盘，实际 IO 仍取决于片上容量和 tile 设计。
-- 公式三件套：`m_new=max(m_old,m_local)`，`l_new=l_old·e^(m_old−m_new)+l_local·e^(m_local−m_new)`，`O_old *= e^(m_old−m_new)`。
-- TileLang 实现的主干是 2 个 `T.gemm`（QKᵀ、PV）加 fragment 中的 max/exp2/sum 与
-  掩码；实际代码长度取决于布局、边界、变长、反向和目标架构。
-- varlen 不改变 Attention 公式，而是将 Q/K/V 打包成 `[total_tokens, H, D]`，用
-  `cu_seqlens` 找到每条样本的起止偏移，并在每个 tile 中使用实际 `q_len/k_len`。
-- varlen 的正确性关键是三件事：packed 地址、query/key 尾部 guard、`Lq != Lk` 时的
-  causal 对齐；性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。
-- 反向靠重计算；`exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
+这一章围绕一个主线展开：为什么 FlashAttention 不需要把 N² 的中间矩阵落盘。朴素 Attention
+慢在 **N² 中间张量的 HBM 往返**，而 FA 用**分块 + 在线 softmax** 避免完整 S/P 落盘，实际
+IO 仍取决于片上容量和 tile 设计。支撑这个结论的公式三件套是
+`m_new=max(m_old,m_local)`、`l_new=l_old·e^(m_old−m_new)+l_local·e^(m_local−m_new)`、
+`O_old *= e^(m_old−m_new)`，它们分别表达「换分母」和「旧输出换分母」两件事。落到 TileLang，
+实现的主干是 2 个 `T.gemm`（QKᵀ、PV）加 fragment 中的 max/exp2/sum 与掩码；实际代码长度
+取决于布局、边界、变长、反向和目标架构。varlen 不改变 Attention 公式，而是将 Q/K/V 打包成
+`[total_tokens, H, D]`，用 `cu_seqlens` 找到每条样本的起止偏移，并在每个 tile 中使用实际
+`q_len/k_len`；其正确性关键是三件事——packed 地址、query/key 尾部 guard、`Lq != Lk` 时的
+causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。最后记住反向靠重计算，
+而 `exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
 
-## 6.7 Checkpoint
+## 6.7 动手任务
+
+在进入第 07 章之前，请完成下面任务，把 online softmax 的推导真正变成你自己的东西：
 
 1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
 2. 以 `N=17`、`D=32` 为边界设计题：列出 Q/K/V tile 的 padding、mask 和输出 guard，
@@ -751,7 +762,9 @@ tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接
    和第 3 个 key 在 packed tensor 中的线性下标；再解释为什么 causal mask 要使用
    `q_local + (Lk-Lq) >= k_local`。
 
-## 口述自测（详答见第 10 章）
+## 6.8 自问自答
+
+下面这些问题用来检验你是否能把这一章的知识讲出来（详答见第 10 章）：
 
 1. **默写在线 softmax 三公式并解释每项**（尤其 rescaling 因子）。
 2. **FA 的 IO 复杂度推导与「为什么 memory-bound」**（O(N²)→O(N²·d²/M)）。

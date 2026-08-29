@@ -1,42 +1,43 @@
 # 第 05 章 GEMM 实战：从朴素实现到可测优化
 
-> **本章目标**：围绕同一个 FP16 GEMM，按「正确基线 → 数据复用 → 流水线 → 布局/调度
-> → 自动调优」的顺序做实验。每一版只改变一个主要因素，并用正确性、生成代码和
-> profiler 说明收益来自哪里；本章不承诺任何固定的峰值比例。
+前面三章铺好了三块基石：第 02 章的语法模型、第 03 章的内存层次与数据复用、第 04 章的
+流水线。现在到了把它们合而为一的地方——GEMM，矩阵乘，GPU 上被研究得最透也最能检验
+功力的一个算子。这一章围绕同一个 FP16 GEMM，按「正确基线 → 数据复用 → 流水线 →
+布局/调度 → 自动调优」的顺序做实验。每一版只改变一个主要因素，并用正确性、生成代码和
+profiler 说明收益来自哪里；本章不承诺任何固定的峰值比例。
 
-**学习信息**
+> **本章导航** 中高级难度，预计 5–8 小时；前置是第 01～04 章，理解 shared、fragment、
+> pipeline 和边界处理。完整版本需要支持 `T.gemm` 的目标 GPU；本章性能数字只在记录的
+> 硬件/版本上成立。学完你会留下一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表
+> 和一份 TFLOPS 报告。写作参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、
+> [TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
 
-- 难度：中高级；预计用时：5–8 小时；
-- 前置：第 01～04 章，理解 shared、fragment、pipeline 和边界处理；
-- 运行范围：完整版本需要支持 `T.gemm` 的目标 GPU；本章性能数字只在记录的硬件/版本上成立；
-- 本章产出：一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表和一份 TFLOPS 报告。
-- 参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、[TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
-
-**阅读路线：**先用 v0 建立「能算对但访存重复」的对照，再只引入 shared tile，随后引入
-流水线。v2 专门处理任意尺寸，v3 只做布局和 block 调度实验，v4 才把已知的参数空间
-交给 autotune。每次实验都保留上一版，避免把多个变化混成一个「黑盒加速」。
+阅读路线建议严格走版本递进：先用 v0 建立「能算对但访存重复」的对照，再只引入 shared
+tile，随后引入流水线。v2 专门处理任意尺寸，v3 只做布局和 block 调度实验，v4 才把已知
+的参数空间交给 autotune。每次实验都保留上一版，避免把多个变化混成一个「黑盒加速」。
 
 ## 5.1 问题与理论峰值
 
-计算 `C[M,N] = A[M,K] × B[K,N]`（行主序）。
+先钉死问题和度量单位。计算 `C[M,N] = A[M,K] × B[K,N]`（行主序）。
 
 - 计算量：`2·M·N·K` FLOPs；
 - 理论峰值取决于 GPU 型号、dtype、稀疏模式、时钟和库路径；请把目标 GPU 的官方规格
   填入实验记录，不要把某张卡的数字当作课程常数；
 - 目标是在明确硬件和测量方法的前提下找到证据，单求一个快的数字不够。
 
-衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。与 cuBLAS/torch 的比较必须
-使用相同输入、dtype、warmup、rep 和同步方式；不要把历史 benchmark 数字直接套到自己的机器。
+衡量标准：**TFLOPS = 2·M·N·K / 延迟(ms) / 1e9**。与 cuBLAS/torch 的比较必须使用相同
+输入、dtype、warmup、rep 和同步方式；不要把历史 benchmark 数字直接套到自己的机器。
 
-这里的公式把延迟单位写成毫秒；等价地，也可以先把延迟换算成秒，再除以 `1e12`。
-如果只统计 A/B 的读取或使用了不同的矩阵乘定义，应在报告中明确说明 FLOPs 口径。
+这里的公式把延迟单位写成毫秒；等价地，也可以先把延迟换算成秒，再除以 `1e12`。如果只
+统计 A/B 的读取或使用了不同的矩阵乘定义，应在报告中明确说明 FLOPs 口径。
 
 ### 5.1.1 先钉死精度语义：fp32 的 `T.gemm` 可能悄悄变成 TF32
 
-"Correct but Slow" 研究（[arxiv 2607.04454](https://arxiv.org/abs/2607.04454)，A100 实测）
-报告过一个必须先知道的陷阱：在 SM80 上，fp32 输入的 `T.gemm` 会**静默降级为 TF32**
-（TensorFloat-32，尾数 10 位），导致 31.8% 的输出无法通过 `rtol=1e-5` 的 fp32 检查，
-而同样形状的手工 FMA 循环却能通过。报告把它归为「精度降级伪影」而非内核 bug。
+在写任何优化之前，先处理一个会让「正确性」结论失效的陷阱。"Correct but Slow" 研究
+（[arxiv 2607.04454](https://arxiv.org/abs/2607.04454)，A100 实测）报告过：在 SM80 上，
+fp32 输入的 `T.gemm` 会**静默降级为 TF32**（TensorFloat-32，尾数 10 位），导致 31.8% 的
+输出无法通过 `rtol=1e-5` 的 fp32 检查，而同样形状的手工 FMA 循环却能通过。报告把它归为
+「精度降级伪影」而非内核 bug。
 
 教程的处理约定：
 
@@ -48,8 +49,8 @@
 
 ## 5.2 版本 0：不碰共享内存（教学用）
 
-每个 block 算一个 `BM×BN` 输出 tile，直接从全局内存累加（K 维每步都读全局）。为
-突出访存差异，下面的 v0 只用于整除尺寸；尾部处理留到 5.4：
+每个 block 算一个 `BM×BN` 输出 tile，直接从全局内存累加（K 维每步都读全局）。为突出
+访存差异，下面的 v0 只用于整除尺寸；尾部处理留到 5.4：
 
 ```python
 import torch
@@ -76,15 +77,15 @@ def gemm_naive(M: int, N: int, K: int, BM: int = 64, BN: int = 64,
     return kern
 ```
 
-**为什么慢**：每个输出元素每步都要从 global memory 读 `A[i,k]` 和 `B[k,j]`，复用
-很差 → 访存量接近 O(MNK)。这是用于建立对照的教学基线；先用小尺寸验证它，再进入
-shared/GEMM 路径，不要把它当作生产实现。
+**为什么慢**：每个输出元素每步都要从 global memory 读 `A[i,k]` 和 `B[k,j]`，复用很差 →
+访存量接近 O(MNK)。这是用于建立对照的教学基线；先用小尺寸验证它，再进入 shared/GEMM
+路径，不要把它当作生产实现。
 
 ## 5.3 版本 1：分块 + 共享内存 + 流水线
 
-核心改动：K 维切成 `BK` 的块；每轮的 `A/B` tile 先 `T.copy` 进共享内存，再用
-`T.gemm` 一句完成 tile 级矩阵乘。具体会落到哪类 Tensor Core/后端指令由目标 GPU、
-dtype 和 TileLang 版本决定，必须用生成源码确认。
+核心改动：K 维切成 `BK` 的块；每轮的 `A/B` tile 先 `T.copy` 进共享内存，再用 `T.gemm`
+一句完成 tile 级矩阵乘。具体会落到哪类 Tensor Core/后端指令由目标 GPU、dtype 和
+TileLang 版本决定，必须用生成源码确认。
 
 ```python
 @jit
@@ -227,8 +228,8 @@ def gemm_v3(M: int, N: int, K: int, BM: int = 128, BN: int = 128, BK: int = 32,
 ```
 
 `T.use_swizzle(panel_size=10, enable=True)` 是另一个层面的「swizzle」——**光栅化
-（rasterization）**：改变 block 的调度顺序（对角线优先而不是按行扫描），提高 L2
-命中率。放在 `T.Kernel` 上下文里即可：
+（rasterization）**：改变 block 的调度顺序（对角线优先而不是按行扫描），提高 L2 命中率。
+放在 `T.Kernel` 上下文里即可：
 
 ```python
 with T.Kernel(...) as (bx, by):
@@ -237,8 +238,8 @@ with T.Kernel(...) as (bx, by):
 ```
 
 交互实验建议：`swizzle=True/False`、`rasterize=True/False`、`num_stages=2/3/4`、
-`threads=128/256`，各跑一次 `do_bench`，记录 TFLOPS 表格——**自己测出来的数据
-比任何教程都有说服力**。
+`threads=128/256`，各跑一次 `do_bench`，记录 TFLOPS 表格——**自己测出来的数据比任何
+教程都有说服力**。
 
 ## 5.6 版本 4：交给 autotune（生产做法）
 
@@ -254,8 +255,8 @@ def gemm_v4(M: int, N: int, K: int, block_M: int = 128, block_N: int = 128,
     return kern
 ```
 
-配置空间、正确性校验、缓存与工程化细节在第 08 章展开，这里只留一句：**先有一个
-正确基线，再让 autotune 替你在 tile 尺寸/流水线深度/线程数上扫最优解**。
+配置空间、正确性校验、缓存与工程化细节在第 08 章展开，这里只留一句：**先有一个正确
+基线，再让 autotune 替你在 tile 尺寸/流水线深度/线程数上扫最优解**。
 
 ## 5.7 分析工具箱（每个版本都要用）
 
@@ -277,9 +278,9 @@ lat_ref = profiler.do_bench(torch_gemm, warmup=25, rep=100)
 print(kernel.get_kernel_source()[:3000])
 ```
 
-看生成代码时的观察点：`T.gemm` 变成了什么（`mma.sync` / `wmma` /
-`wgmma` 等）；`T.copy` 是否变成 `cp.async` + 屏障；K 循环是否出现 prologue/
-steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
+看生成代码时的观察点：`T.gemm` 变成了什么（`mma.sync` / `wmma` / `wgmma` 等）；`T.copy`
+是否变成 `cp.async` + 屏障；K 循环是否出现 prologue/steady/epilogue 结构；`T.Parallel`
+是否被向量化成 `float4`。
 
 ### 5.7.1 大 GEMM 的两个结构性陷阱：调优网格与 L2 驻留
 
@@ -295,8 +296,8 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
    缺少这类启发式时只有 49.4% 命中、呈 DRAM-bound。教训：大尺寸下
    `T.use_swizzle`（光栅化调度）改善 L2 局部性的意义远超小尺寸，值得单独开关实验。
 
-这两项都属于「结构性残留」：改作者代码救不回来，要靠调度空间和缓存策略。第 09 章
-给出对应的 Nsight 判据（L2 命中率、DRAM 吞吐、TFLOPS 对扫参曲线）。
+这两项都属于「结构性残留」：改作者代码救不回来，要靠调度空间和缓存策略。第 09 章给出
+对应的 Nsight 判据（L2 命中率、DRAM 吞吐、TFLOPS 对扫参曲线）。
 
 ## 5.8 进阶方向（先知道它们解决什么问题）
 
@@ -313,9 +314,10 @@ steady/epilogue 结构；`T.Parallel` 是否被向量化成 `float4`。
 
 ### 5.8.1 “结果正确”和“值得替换库”是两道门槛
 
-社区教程常展示某个特定形状上接近或超过库实现的结果，但这不等于交付完成。
-一项面向 GPU DSL 的[经验研究](https://arxiv.org/abs/2607.04454) 专门量化了「结果正确但远慢于库」这一评估缺口。
-它的样本和设备有限，不能推广成「所有 TileLang 内核都慢」；可引出的正确结论是，真实交付至少要回答两组问题：
+社区教程常展示某个特定形状上接近或超过库实现的结果，但这不等于交付完成。一项面向 GPU
+DSL 的[经验研究](https://arxiv.org/abs/2607.04454) 专门量化了「结果正确但远慢于库」这一
+评估缺口。它的样本和设备有限，不能推广成「所有 TileLang 内核都慢」；可引出的正确结论是，
+真实交付至少要回答两组问题：
 
 1. **正确性覆盖**：整除、尾部、小尺寸、不同 dtype、转置和数值极端输入是否通过？
 2. **替换价值**：目标 shape 分布上的延迟、吞吐、编译成本和端到端收益，是否优于现有路径？
@@ -331,15 +333,17 @@ relative_efficiency = reference_library_latency / tilelang_latency
 warmup、rep 和计时范围一致。若内核只在一个 shape 上占优，就把 dispatch 范围限制在该 shape
 bucket，而不是替换所有 GEMM。
 
-## 5.9 本章小结
+## 5.9 本章回顾
 
-- 朴素版的主要问题是**缺少数据复用**；分块、shared 和流水线构成常见的优化路径。
-- 优化顺序：正确基线 → `T.Pipelined` → swizzle 布局 → 光栅化 → autotune → 逐项
-  用 TFLOPS 验证。
-- `T.gemm` 是 tile 级原语：内部完成布局分发与 Tensor Core 指令选择。
-- 一句话总结：**GEMM 的优化通常围绕内存复用、流水线重叠和目标指令利用展开**。
+这一章把前三章的概念凝成了一个可迭代的 GEMM。朴素版的主要问题是**缺少数据复用**；
+分块、shared 和流水线构成常见的优化路径。优化顺序可以记为：正确基线 → `T.Pipelined`
+→ swizzle 布局 → 光栅化 → autotune → 逐项用 TFLOPS 验证。`T.gemm` 是 tile 级原语：
+内部完成布局分发与 Tensor Core 指令选择。一句话总结：**GEMM 的优化通常围绕内存复用、
+流水线重叠和目标指令利用展开**。
 
-## 5.10 Checkpoint
+## 5.10 动手任务
+
+完成下面任务再进入第 07 章：
 
 1. 先只运行 v0 和 v1，给出正确性结果和延迟；
 2. 用一个 M/N/K 都不整除的尺寸验证 guarded copy 或 host padding；
@@ -347,7 +351,9 @@ bucket，而不是替换所有 GEMM。
 4. 以表格记录 latency、TFLOPS、shared memory/寄存器线索和生成代码观察；
 5. 解释为什么某个配置更快，不能只写「autotune 选中了它」。
 
-## 口述自测（详答见第 10 章）
+## 自问自答
+
+下面这些问题用来检验你是否能把这一章的知识讲出来（详答见第 10 章）：
 
 1. **口述分块 GEMM 的数据流**（global→shared→fragment→global，K 维流水线）。
 2. **为什么 TileLang 能 20 行写完 CUDA 要 200 行的 GEMM？**（布局推断 + 流水线自动注入 + T.gemm 直通 Tensor Core）。

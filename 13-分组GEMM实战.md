@@ -1,23 +1,28 @@
 # 第 13 章 分组 GEMM：从多个小矩阵到 MoE 内核
 
-> **本章目标**：理解分组 GEMM（Grouped GEMM）为什么出现在 Mixture of Experts（MoE）等模型中，掌握不规则矩阵组的表示、tile 映射和边界处理，并能用 TileLang 写出一个「多个小 GEMM 共用一次调度」的内核骨架。
+前面第 05 章带你走通了 GEMM 从分块、流水线到自动调优的完整工程路径，而这一章要做的是
+把那条经验放到一个更不规则的世界里检验：当一次计算里混着许多不同大小的矩阵乘，而不是
+一个规整的大矩阵时，原来那套"每个 block 对一个固定 tile"的调度还成立吗？这正是分组
+GEMM（Grouped GEMM）要回答的问题，也是它在 Mixture of Experts（MoE）这类模型里频繁
+登场的原因。学完这一章，你会掌握不规则矩阵组的表示、tile 映射和边界处理，并能用
+TileLang 写出一个「多个小 GEMM 共用一次调度」的内核骨架——本质上，这是把第 05 章的
+GEMM 经验做一次专项扩展，让它也能扛住形状极度不均的真实负载。
 
-**学习信息**
+> **本章导航** 高级专项难度，预计 4–6 小时。前置是第 05 章 GEMM、第 07 章布局与高级
+> 指令、第 08 章自动调优。运行范围以 CUDA GPU 为主线，完整性能实验需要支持 `T.gemm`
+> 的 GPU 和匹配的 TileLang 版本。本章产出一份 grouped GEMM 正确性测试、一张分组元数据
+> 表、一份 kernel-only 与 end-to-end 性能对比。官方参考：[Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)、
+> [TileLang fused-MoE 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)。
 
-- 难度：高级专项；预计用时：4–6 小时；
-- 前置：第 05 章 GEMM、第 07 章布局与高级指令、第 08 章自动调优；
-- 运行范围：主线以 CUDA GPU 为目标，完整性能实验需要支持 `T.gemm` 的 GPU 和匹配的 TileLang 版本；
-- 本章产出：一份 grouped GEMM 正确性测试、一张分组元数据表、一份 kernel-only 与 end-to-end 性能对比；
-- 官方参考：[Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)、[TileLang fused-MoE 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)。
-
-**阅读路线：**先用数学定义和小例子说明「每组的 `M_g` 不同」会改变什么；再看 packed layout、
-offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理空组、尾部 tile、
-形状分桶和端到端 MoE 开销。不要一开始把 `group_idx_for_block` 当成固定 API：在本章中，
-它只是把线性 block 映射回组编号的元数据。
+阅读的路线建议这样走：先用数学定义和小例子说明「每组的 `M_g` 不同」会改变什么；再看
+packed layout、offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理
+空组、尾部 tile、形状分桶和端到端 MoE 开销。有一点要先说清，避免你一开始就被误导：
+不要把 `group_idx_for_block` 当成固定 API——在本章中，它只是把线性 block 映射回组编号
+的元数据。
 
 ## 13.1 为什么需要分组 GEMM
 
-普通 GEMM 只有一组矩阵：
+先退回到普通 GEMM，它只有一组矩阵：
 
 $$
 C = A \times B,\qquad A\in\mathbb{R}^{M\times K},
@@ -578,7 +583,7 @@ bm_id, group_id, group_row0, output_row0, valid_m
 
 不要打印整个 fragment 或整个 tile。设备端打印会改变时序，也不能作为性能测量工具。定位完成后删除打印，再重新运行正确性和 benchmark。
 
-## 13.11 练习与 Checkpoint
+## 13.11 练习与动手任务
 
 ### 练习 1：回忆
 
@@ -621,9 +626,9 @@ M=[130,32,256], N=256, BM=BN=128
 2. 哪个 profiler 指标或生成代码片段支持这个判断？
 3. 如果 `N/K` 也不相同，你会选择分桶、指针式 kernel，还是退回库调用？为什么？
 
-### Checkpoint
+### 动手任务
 
-本章完成标准不是「能背出 Grouped GEMM 的定义」，而是留下以下产物：
+本章的完成标准不是「能背出 Grouped GEMM 的定义」，而是留下以下产物：
 
 1. 一份 host 侧参考实现和至少 3 组边界测试；
 2. 一张包含 `group_sizes`、`row_offsets`、`padded_offsets`、`group_idx_for_block` 的 metadata 表；
@@ -633,19 +638,25 @@ M=[130,32,256], N=256, BM=BN=128
 6. 若把本章作为 Capstone，补充 group-size 分布、路由/pack/scatter 成本和 dispatch 范围，
    不能只提交矩阵乘 kernel 的最快数字。
 
-## 13.12 本章小结
+## 13.12 本章回顾
 
-- Grouped GEMM 的核心不在新的乘法公式，而在**不规则 group 的表示与调度映射**；
-- `group_sizes` 描述真实工作量，`row_offsets` 描述 packed 逻辑位置，`padded_offsets` 描述 tile 对齐后的物理位置，`group_idx_for_block` 把线性 block 映射回 group；
-- 普通 GEMM 的 shared、fragment、`T.Pipelined` 和 `T.gemm` 仍然适用，新增的是组选择、地址偏移和尾部保护；
-- padding、空组、K/N 尾部、分组倾斜和端到端 dispatch 都可能决定最终性能；
-- 先建立逐组参考和正确 baseline，再做 packed、分桶、pipeline、layout 和 persistent 调度实验；
-- 具体 API、布局约束和后端支持以当前 TileLang 官方 grouped GEMM 示例为准。
+这一章把第 05 章的 GEMM 经验扩展到了形状不规则的场景，而它的核心洞见其实很集中：
+Grouped GEMM 的难点不在新的乘法公式，而在**不规则 group 的表示与调度映射**。落到具体
+数据上，`group_sizes` 描述真实工作量，`row_offsets` 描述 packed 逻辑位置，
+`padded_offsets` 描述 tile 对齐后的物理位置，`group_idx_for_block` 则把线性 block 映射
+回 group。需要记住的是，普通 GEMM 的 shared、fragment、`T.Pipelined` 和 `T.gemm`
+仍然适用，新增的只是组选择、地址偏移和尾部保护这层外壳。至于性能，padding、空组、
+K/N 尾部、分组倾斜和端到端 dispatch 都可能决定最终结果，所以要先建立逐组参考和正确
+baseline，再做 packed、分桶、pipeline、layout 和 persistent 调度实验；具体的 API、布局
+约束和后端支持，始终以当前 TileLang 官方 grouped GEMM 示例为准。
 
 下一步进入 [第 14 章](14-Capstone真实算子交付.md)，把本章的 grouped GEMM 放回完整
 MoE 路径，或选择另一个真实算子完成契约、测试、优化、库对比和 fallback。
 
-## 13.13 口述自测
+## 13.13 自问自答
+
+这些问题用于检验你是否能把本章的知识讲出来。作答时尽量把"表示—映射—边界"这条线串
+完整，而不只是复述单条结论：
 
 1. 为什么 grouped GEMM 不能简单等同于 batched GEMM？
 2. `group_idx_for_block` 解决了什么问题？它为什么适合在 host 侧预计算？
