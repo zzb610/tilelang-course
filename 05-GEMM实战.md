@@ -12,7 +12,13 @@
 各版本都保留下来，因为性能优化的知识恰恰存在于版本之间的差异。我们要解释一次改动为何
 有效、代价是什么、在什么形状上失效，而不是只展示最终最快的代码。
 
-## 5.1 先确定数学问题与测量尺度
+> **本章导航** 中高级难度，预计 5–8 小时；前置是第 01～04 章，理解 shared、fragment、
+> pipeline 和边界处理。完整版本需要支持 `T.gemm` 的目标 GPU；本章性能数字只在记录的
+> 硬件/版本上成立。学完你会留下一个整除尺寸基线、一个 edge-shape 设计、一张版本对比表
+> 和一份 TFLOPS 报告。写作参考：[官方 GEMM 示例](https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py)、
+> [TileLang Overview](https://github.com/tile-ai/tilelang/blob/main/docs/get_started/overview.md)。
+
+## 5.1 问题与理论峰值
 
 先钉死问题和度量单位。计算 `C[M,N] = A[M,K] × B[K,N]`（行主序）。
 
@@ -329,7 +335,7 @@ relative_efficiency = reference_library_latency / tilelang_latency
 warmup、rep 和计时范围一致。若内核只在一个 shape 上占优，就把 dispatch 范围限制在该 shape
 bucket，而不是替换所有 GEMM。
 
-## 5.9 从规则矩阵乘走向融合算子
+## 5.9 本章回顾
 
 这一章把前三章的概念凝成了一个可迭代的 GEMM。朴素版的主要问题是**缺少数据复用**；
 分块、shared 和流水线构成常见的优化路径。优化顺序可以记为：正确基线 → `T.Pipelined`
@@ -337,9 +343,9 @@ bucket，而不是替换所有 GEMM。
 内部完成布局分发与 Tensor Core 指令选择。一句话总结：**GEMM 的优化通常围绕内存复用、
 流水线重叠和目标指令利用展开**。
 
-## 5.10 实验与思考
+## 5.10 动手任务
 
-以下实验的重点是保留版本差异。只有前后版本都可复现，性能变化才有解释对象。
+以下实验的重点是保留版本差异。只有前后版本都可复现，性能变化才有解释对象。完成下面任务再进入第 6 章：
 
 1. 先只运行 v0 和 v1，给出正确性结果和延迟；
 2. 用一个 M/N/K 都不整除的尺寸验证 guarded copy 或 host padding；
@@ -347,7 +353,7 @@ bucket，而不是替换所有 GEMM。
 4. 以表格记录 latency、TFLOPS、shared memory/寄存器线索和生成代码观察；
 5. 解释为什么某个配置更快，不能只写「autotune 选中了它」。
 
-## 5.11 理解检验
+## 5.11 自问自答
 
 下面这些问题用来检验你是否能把这一章的知识讲出来（详答见第 10 章）：
 

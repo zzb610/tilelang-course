@@ -12,6 +12,13 @@ FlashAttention 的关键不在于把矩阵乘写得更短，而在于找到一�
 到来后旧状态为何仍能与新状态合并。理解这个不变量之后，因果掩码、反向重计算和变长序列
 才不再是彼此孤立的技巧，而是同一数据流模型在不同边界下的延伸。
 
+> **本章导航** 高级难度，预计 5–8 小时；前置是第 03～05 章里关于分块 GEMM、归约、mask
+> 和 fp16/fp32 混合精度的知识。完整前向示例需要支持 `T.gemm`/fragment 的 GPU，请先用
+> 小尺寸做正确性，不要直接运行大尺寸参考实现。学完你会留下 online softmax 的推导、一份
+> 小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。参考：[官方 FlashAttention examples](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention)、
+> [DeepSeek MLA 文档](https://tilelang.com/deeplearning_operators/deepseek_mla.html) 和
+> [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
+
 ## 6.1 朴素 Attention 为什么慢
 
 先看朴素 Attention 的三行定义，它直接暴露出问题所在：
@@ -730,7 +737,7 @@ Attention 配对利用率 = 37 / 50 = 74%
 tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接近的官方测试文件出发，再
 保留自己的 reference 和 edge cases。
 
-## 6.6 从在线状态走向物理执行
+## 6.6 本章回顾
 
 这一章围绕一个主线展开：为什么 FlashAttention 不需要把 N² 的中间矩阵落盘。朴素 Attention
 慢在 **N² 中间张量的 HBM 往返**，而 FA 用**分块 + 在线 softmax** 避免完整 S/P 落盘，实际
@@ -744,9 +751,11 @@ IO 仍取决于片上容量和 tile 设计。支撑这个结论的公式三件�
 causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。最后记住反向靠重计算，
 而 `exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
 
-## 6.7 实验与思考
+## 6.7 动手任务
 
 在进入第 07 章之前，请完成下面任务，把 online softmax 的推导真正变成你自己的东西：
+
+完成下面任务再进入第 07 章：
 
 1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
 2. 以 `N=17`、`D=32` 为边界设计题：列出 Q/K/V tile 的 padding、mask 和输出 guard，
@@ -757,7 +766,7 @@ causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间�
    和第 3 个 key 在 packed tensor 中的线性下标；再解释为什么 causal mask 要使用
    `q_local + (Lk-Lq) >= k_local`。
 
-## 6.8 理解检验
+## 6.8 自问自答
 
 下面这些问题用来检验你是否能把这一章的知识讲出来（详答见第 10 章）：
 

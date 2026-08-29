@@ -128,7 +128,7 @@
 | 08：调优 | Autotuning Guide | release/discussion 中的调优变更 |
 | 09：调试 | Tools Overview、IR Lower Trace | Compile-Only、AutoDD、Compute Sanitizer、Nsight |
 | 13：Grouped GEMM | grouped GEMM、fused-MoE 示例 | 量化 grouped GEMM 与目标架构实现 |
-| 14：Capstone | 官方 examples 中目标算子 | issue/discussion、社区工程文章与 vendor 基线 |
+| 14：收官项目 | 官方 examples 中目标算子 | issue/discussion、社区工程文章与 vendor 基线 |
 
 阅读资料不是课程产出。读完后至少要留下一个可验证对象：最小代码、边界反例、生成代码片段、
 profile 记录或对照表。
