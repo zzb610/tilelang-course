@@ -1,21 +1,16 @@
 # 第 06 章 FlashAttention 手写实现
 
-第 05 章我们学会了把矩阵乘切成 tile、交给 `T.gemm` 高效执行，但 GEMM 只是骨架：真实的
-Transformer 里，最昂贵的算子往往是注意力。从朴素 Attention 的存储问题出发，我们要推导
-出在线 softmax，再把公式映射到两个 tile GEMM 和一个分块循环上。这一章的学习重点不是背下
-一份长代码，而是理解「为什么这样更新仍然等价」；代码验证通过后，再讨论 IO、反向重计算和
-变体。
+GEMM 可以把输入切成 tile，因为每个局部乘积最终只需累加到对应的输出位置。Attention 更
+棘手：softmax 的一个输出取决于整行分母，看上去必须先保存完整的 `QK^T`，等整行都出现后
+才能归一化。这个“必须”正是本章要重新审视的地方。
 
-> **本章导航** 高级难度，预计 5–8 小时；前置是第 03～05 章里关于分块 GEMM、归约、mask
-> 和 fp16/fp32 混合精度的知识。完整前向示例需要支持 `T.gemm`/fragment 的 GPU，请先用
-> 小尺寸做正确性，不要直接运行大尺寸参考实现。学完你会留下 online softmax 的推导、一份
-> 小尺寸 causal/non-causal 校验，以及 IO 复杂度解释。参考：[官方 FlashAttention examples](https://github.com/tile-ai/tilelang/tree/main/examples/flash_attention)、
-> [DeepSeek MLA 文档](https://tilelang.com/deeplearning_operators/deepseek_mla.html) 和
-> [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)。
+FlashAttention 的关键不在于把矩阵乘写得更短，而在于找到一组可以跨 tile 延续的状态。
+只要运行最大值、归一化分母和部分输出能够在看到新块时被正确重标定，完整的分数矩阵就不必
+写回全局内存。本章先从代数上证明这件事，再把推导映射到两个 tile GEMM 和一个分块循环。
 
-阅读时建议先把 `S → P → O` 的数据形状写清楚，再只学习 `(m, l, O)` 三个在线状态，随后
-逐段阅读实现，最后分开做「整除尺寸正确性」和「尾部尺寸设计」。途中要始终分清三个不同的
-问题：dense reference 能否运行、kernel 是否正确、kernel 是否高效——它们各自有各自的判据。
+长代码只是推导的展开。阅读时应不断追问 `(m, l, O)` 分别保存了什么不变量，以及新 tile
+到来后旧状态为何仍能与新状态合并。理解这个不变量之后，因果掩码、反向重计算和变长序列
+才不再是彼此孤立的技巧，而是同一数据流模型在不同边界下的延伸。
 
 ## 6.1 朴素 Attention 为什么慢
 
@@ -735,7 +730,7 @@ Attention 配对利用率 = 37 / 50 = 74%
 tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接近的官方测试文件出发，再
 保留自己的 reference 和 edge cases。
 
-## 6.6 本章回顾
+## 6.6 从在线状态走向物理执行
 
 这一章围绕一个主线展开：为什么 FlashAttention 不需要把 N² 的中间矩阵落盘。朴素 Attention
 慢在 **N² 中间张量的 HBM 往返**，而 FA 用**分块 + 在线 softmax** 避免完整 S/P 落盘，实际
@@ -749,7 +744,7 @@ IO 仍取决于片上容量和 tile 设计。支撑这个结论的公式三件�
 causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。最后记住反向靠重计算，
 而 `exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
 
-## 6.7 动手任务
+## 6.7 实验与思考
 
 在进入第 07 章之前，请完成下面任务，把 online softmax 的推导真正变成你自己的东西：
 
@@ -762,7 +757,7 @@ causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间�
    和第 3 个 key 在 packed tensor 中的线性下标；再解释为什么 causal mask 要使用
    `q_local + (Lk-Lq) >= k_local`。
 
-## 6.8 自问自答
+## 6.8 理解检验
 
 下面这些问题用来检验你是否能把这一章的知识讲出来（详答见第 10 章）：
 

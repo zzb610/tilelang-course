@@ -1,24 +1,17 @@
 # 第 13 章 分组 GEMM：从多个小矩阵到 MoE 内核
 
-前面第 05 章带你走通了 GEMM 从分块、流水线到自动调优的完整工程路径，而这一章要做的是
-把那条经验放到一个更不规则的世界里检验：当一次计算里混着许多不同大小的矩阵乘，而不是
-一个规整的大矩阵时，原来那套"每个 block 对一个固定 tile"的调度还成立吗？这正是分组
-GEMM（Grouped GEMM）要回答的问题，也是它在 Mixture of Experts（MoE）这类模型里频繁
-登场的原因。学完这一章，你会掌握不规则矩阵组的表示、tile 映射和边界处理，并能用
-TileLang 写出一个「多个小 GEMM 共用一次调度」的内核骨架——本质上，这是把第 05 章的
-GEMM 经验做一次专项扩展，让它也能扛住形状极度不均的真实负载。
+普通 GEMM 的规则性给了我们一个舒适前提：每个 block 都处理同样大小的输出 tile。MoE
+打破了这个前提。token 被路由到不同 expert 后，各组的行数随输入变化；有的组很大，有的组
+很小，甚至为空。乘法公式没有改变，工作量的分布却不再规则。
 
-> **本章导航** 高级专项难度，预计 4–6 小时。前置是第 05 章 GEMM、第 07 章布局与高级
-> 指令、第 08 章自动调优。运行范围以 CUDA GPU 为主线，完整性能实验需要支持 `T.gemm`
-> 的 GPU 和匹配的 TileLang 版本。本章产出一份 grouped GEMM 正确性测试、一张分组元数据
-> 表、一份 kernel-only 与 end-to-end 性能对比。官方参考：[Grouped GEMM examples](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm)、
-> [TileLang fused-MoE 示例](https://github.com/tile-ai/tilelang/blob/main/examples/fusedmoe/example_fusedmoe_tilelang.py)。
+这使 Grouped GEMM 的主要困难从“怎样做矩阵乘”转移到“怎样表示和调度一组不同大小的矩阵
+乘”。packed layout 决定数据如何连续存放，前缀和描述每组的边界，block 映射把线性工作编号
+还原为 group 与 tile 坐标。第 05 章的 shared、fragment、流水线和 `T.gemm` 仍在内层发挥
+作用，只是外面多了一层不规则映射。
 
-阅读的路线建议这样走：先用数学定义和小例子说明「每组的 `M_g` 不同」会改变什么；再看
-packed layout、offset 和 block 映射；随后阅读带 padding 前提的 TileLang 骨架；最后处理
-空组、尾部 tile、形状分桶和端到端 MoE 开销。有一点要先说清，避免你一开始就被误导：
-不要把 `group_idx_for_block` 当成固定 API——在本章中，它只是把线性 block 映射回组编号
-的元数据。
+本章通过一个具体的小组分布逐步建立这层映射，再讨论 padding、空组、分桶和端到端 MoE
+开销。文中的 `group_idx_for_block` 是这种映射的一份元数据，不是 TileLang 保证存在的固定
+API。这个区别也提醒我们：工程设计首先来自工作负载的结构，而不是来自可调用的函数名。
 
 ## 13.1 为什么需要分组 GEMM
 
@@ -583,7 +576,7 @@ bm_id, group_id, group_row0, output_row0, valid_m
 
 不要打印整个 fragment 或整个 tile。设备端打印会改变时序，也不能作为性能测量工具。定位完成后删除打印，再重新运行正确性和 benchmark。
 
-## 13.11 练习与动手任务
+## 13.11 实验：让不规则映射接受反例
 
 ### 练习 1：回忆
 
@@ -626,7 +619,7 @@ M=[130,32,256], N=256, BM=BN=128
 2. 哪个 profiler 指标或生成代码片段支持这个判断？
 3. 如果 `N/K` 也不相同，你会选择分桶、指针式 kernel，还是退回库调用？为什么？
 
-### 动手任务
+### 交付材料
 
 本章的完成标准不是「能背出 Grouped GEMM 的定义」，而是留下以下产物：
 
@@ -638,7 +631,7 @@ M=[130,32,256], N=256, BM=BN=128
 6. 若把本章作为 Capstone，补充 group-size 分布、路由/pack/scatter 成本和 dispatch 范围，
    不能只提交矩阵乘 kernel 的最快数字。
 
-## 13.12 本章回顾
+## 13.12 从专项算子走向完整交付
 
 这一章把第 05 章的 GEMM 经验扩展到了形状不规则的场景，而它的核心洞见其实很集中：
 Grouped GEMM 的难点不在新的乘法公式，而在**不规则 group 的表示与调度映射**。落到具体
@@ -653,7 +646,7 @@ baseline，再做 packed、分桶、pipeline、layout 和 persistent 调度实�
 下一步进入 [第 14 章](14-Capstone真实算子交付.md)，把本章的 grouped GEMM 放回完整
 MoE 路径，或选择另一个真实算子完成契约、测试、优化、库对比和 fallback。
 
-## 13.13 自问自答
+## 13.13 理解检验
 
 这些问题用于检验你是否能把本章的知识讲出来。作答时尽量把"表示—映射—边界"这条线串
 完整，而不只是复述单条结论：
