@@ -27,3 +27,8 @@ ref_c = a + b
 torch.testing.assert_close(c, ref_c)
 print('ref_c=', ref_c)
 print('c=', c)
+
+print(my_add.get_kernel_source()) # type: ignore
+
+# profiler = my_add.get_profiler() # type: ignore
+# print(profiler.do_bench())
