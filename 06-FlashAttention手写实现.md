@@ -29,15 +29,14 @@ P = softmax(S, dim=-1)     # 需要整行才能归一化！
 O = P @ V                  # [B,H,N,d]
 ```
 
-这段计算有两个致命问题，而且彼此关联。第一个问题是**显存爆炸**：`S` 和 `P` 都是 `N×N`，
-序列 32K 时单头仅一个 fp16 中间张量就约 2 GiB，多头和多 batch 还会更快放大。第二个问题是
-**IO 浪费**：softmax 的归一化分母需要看到整行，所以 `Q@K^T` 的结果必须先写回 HBM，
+这段计算有两个相互关联的问题。第一，`S` 和 `P` 都是 `N×N`：序列长度为 32K 时，单头的
+一个 fp16 中间张量约占 2 GiB，多头和多 batch 会继续增加显存占用。第二，softmax 的归一化
+分母需要整行数据，因此 `Q@K^T` 的结果必须先写回 HBM，
 `P@V` 时再读回来——**同一份中间数据被存取两遍**。
 
-讲到这两个问题时，先停下，亲手把代价算一遍，因为它们一出来就是致命的。拿这串数字跟手算
-对一下：`N²` 个元素，一半存成 fp16（每元素 2 字节），一个头就是 `32K×32K×2B = 2 GiB`，
-和上面那句「单头约 2 GiB」正好对上。至于 IO，softmax 的分母要等整行到齐，于是中间结果先
-写回 HBM、`P@V` 时再读回来，你等于付了两次全局内存往返，却只是在来回捎带同一个数字。
+可以直接计算这项代价：`N²` 个 fp16 元素，每个元素 2 字节，单头占用为
+`32K×32K×2 B = 2 GiB`。在 IO 方面，中间结果先写回 HBM，再在 `P@V` 阶段读回，产生两次
+全局内存传输。
 
 换句话说，朴素实现会把 O(N²) 的中间结果写回/读回 HBM，而计算量本身是 O(N²·d)。FlashAttention
 的解法是**分块 + 在线 softmax**：把 N 维切成块，在片上滚动维护「部分归一化」，不把完整
@@ -71,10 +70,8 @@ l_new   = l_prev · exp(m_prev − m_new) + l_local · exp(m_local − m_new)
 `exp(m_prev − m_new)`。推导一句话概括：**归一化变了，分母换了，旧的分子乘上「换分母的
 修正因子」就行**——不用重读任何东西。
 
-这个公式乍一看像变戏法——明明来了一个新的分数块，凭什么只要乘一个标量就齐了？先承认
-这个反直觉，再落回代数：softmax 的分子是 `exp(s_j − m)`，分母换成新最大值后，每个老分子
-都要乘上 `exp(m_0ld − m_new)` 才能保持比值不变。看起来玄乎，其实它只是把「换分母」这件
-事写出来了，没有别的新东西。
+这个更新只需要乘一个标量，原因可以从代数上得到。softmax 的分子是 `exp(s_j − m)`；最大值
+更新后，已有分子都要乘上 `exp(m_old − m_new)`，才能保持相同的归一化比例。
 
 在 TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做的工作正好对应上面三步：
 
@@ -148,7 +145,7 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
             O_shared = T.alloc_shared((block_M, dim), dtype)       # shape: [BM, D]
 
             acc_s = T.alloc_fragment((block_M, block_N), accum_dtype)  # shape: [BM, BN]，S 块
-            acc_s_cast = T.alloc_fragment((block_M, block_N), dtype)   # shape: [BM, BN]，喂 GEMM 要 fp16
+            acc_s_cast = T.alloc_fragment((block_M, block_N), dtype)   # shape: [BM, BN]，作为 GEMM 输入时使用 fp16
             acc_o = T.alloc_fragment((block_M, dim), accum_dtype)      # shape: [BM, D]，P@V 累加
             scores_max = T.alloc_fragment((block_M,), accum_dtype)     # shape: [BM]
             scores_max_prev = T.alloc_fragment((block_M,), accum_dtype) # shape: [BM]
@@ -204,7 +201,7 @@ def flashattn(batch: int, heads: int, seq_len: int, dim: int,
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)          # fp32 → fp16 再喂 GEMM
+                T.copy(acc_s, acc_s_cast)          # fp32 → fp16，再作为 GEMM 输入
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]   # 老输出重缩放
@@ -572,7 +569,7 @@ q_local >= k_local
 token，此时直接比较局部坐标会把 query 错误地当成从序列开头开始。你难免会问：既然只是
 比较两个局部坐标，为什么长度一变就失效了？因为 `q_local >= k_local` 暗中假设 query 和
 key 从同一个位置起算；一旦 `Lq != Lk`，query 已经被右对齐到 KV 尾部，它的局部下标 0
-对应的是完整序列里的 `offset` 位置，不先加上这个偏移，比较就落到了错误的锚点上。常见的
+对应的是完整序列里的 `offset` 位置。如果不先加上这个偏移，比较使用的就不是正确的序列位置。常见的
 右对齐语义是：
 
 ```text
@@ -596,10 +593,10 @@ offset = Lk - Lq
 
 ### 6.5.6 如何验证：先按序列比较，再比较 packed 输出
 
-看到 packed 张量，你多半会想问：为什么不干脆把所有 token 拼起来，跟一个 padded
-Attention 的结果直接比？因为 padded reference 会把 padding token 也当成有效位置算进
+不能把所有 token 直接拼接后与一个 padded Attention 结果比较，因为 padded reference 会把
+padding token 也当成有效位置计入
 softmax 的分母，而正确的 varlen 里不同样本之间、以及 padding 位置都不该互相「看见」。
-如果混在一起比，你连错了哪条序列都看不出来。正确做法是：
+混合比较也无法定位具体出错的序列。正确做法是：
 
 1. 为每条样本分别生成 Q/K/V 和 dense reference；
 2. 在每条样本内部完成 causal/non-causal Attention；
@@ -711,16 +708,14 @@ Attention 配对利用率 = 37 / 50 = 74%
   多个 block，最后用 lse 合并 partial result；核心仍然是在线 softmax 的可结合更新。
 - **反向 varlen**：除了前向的 `cu_seqlens_q/k`，还要保证梯度输出与 packed Q/K/V 的
   顺序一致；重计算的每个 tile 必须复用同一套边界和 causal 对齐规则。
-- **MLA（Multi-head Latent Attention，DeepSeek）**：见下面的专节——它是本章所有概念
-  （在线 softmax、fragment、`GemmWarpPolicy`、warp specialization）的汇合点。
+- **MLA（Multi-head Latent Attention，DeepSeek）**：见下面的专节。该实现会同时用到
+  在线 softmax、fragment、`GemmWarpPolicy` 和 warp specialization。
 
 ### 6.5.8.1 MLA decode：寄存器压力如何决定 warp 分工
 
 一篇社区工程文章（[Writing High-Performance Kernels in TileLang, from GEMM to MLA](https://huggingface.co/blog/AtlasCloud-AI/writing-high-performance-kernels-in-tilelang)）
-把 MLA 讲成了本章概念的总复习，核心难点不是数学而是**寄存器预算**：
-
-读完你会发现，踩坑的人一开始并没在数学上卡住，而是先撞进了一道墙——手上没有那么多
-寄存器可用：
+用 MLA 串联了本章的多个概念，其主要限制不是数学公式，而是**寄存器预算**。可用寄存器不足
+会出现以下问题：
 
 1. **形状**：MLA 的 query/key 宽 576（512 的 no-pe 部分 + 64 的 rope 部分）、value 宽 512，
    所以输出累加器 `acc_o = [block_M, 512]` 必须在整个 KV 循环期间常驻寄存器。
@@ -741,7 +736,7 @@ Attention 配对利用率 = 37 / 50 = 74%
 并单独记录 tile、policy、warpgroup 数与生成源码。
 
 这节想传递的结论是：**当寄存器不够时，改的不是数学，而是 warp policy 与 staging**；
-第 07 章的布局推断在这里兑现为「选一个 policy，编译器替你完成数据交换」。
+这里可以看到第 07 章所述布局推断的实际作用：选择 policy 后，编译器生成相应的数据交换代码。
 
 ### 6.5.9 先按语义选示例，不按文件名复制
 
@@ -765,7 +760,7 @@ tile、warp policy 或性能数字直接套到训练态 MHA。先从语义最接
 
 这一章围绕一个主线展开：为什么 FlashAttention 不需要把 N² 的中间矩阵落盘。朴素 Attention
 慢在 **N² 中间张量的 HBM 往返**，而 FA 用**分块 + 在线 softmax** 避免完整 S/P 落盘，实际
-IO 仍取决于片上容量和 tile 设计。支撑这个结论的公式三件套是
+IO 仍取决于片上容量和 tile 设计。支撑这个结论的三个公式是
 `m_new=max(m_old,m_local)`、`l_new=l_old·e^(m_old−m_new)+l_local·e^(m_local−m_new)`、
 `O_old *= e^(m_old−m_new)`，它们分别表达「换分母」和「旧输出换分母」两件事。落到 TileLang，
 实现的主干是 2 个 `T.gemm`（QKᵀ、PV）加 fragment 中的 max/exp2/sum 与掩码；实际代码长度
@@ -777,9 +772,7 @@ causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间�
 
 ## 6.7 动手任务
 
-在进入第 07 章之前，请完成下面任务，把 online softmax 的推导真正变成你自己的东西：
-
-完成下面任务再进入第 07 章：
+下面的任务用于检验是否能够独立推导并应用 online softmax：
 
 1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
 2. 以 `N=17`、`D=32` 为边界设计题：列出 Q/K/V tile 的 padding、mask 和输出 guard，
