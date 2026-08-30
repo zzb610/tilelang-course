@@ -5,15 +5,15 @@
 组很小，甚至为空。乘法公式一个字都没变，工作量的分布却不再规则。这种「看起来一样的活，
 分到手却有人多有人少」的错位，正是这一章要面对的问题。
 
-于是 Grouped GEMM 的主要困难从「怎样做矩阵乘」转移到「怎样表示和调度一组不同大小的矩阵
-乘」：packed layout 决定数据如何连续存放，前缀和描述每组的边界，block 映射把线性工作编号
-还原为 group 与 tile 坐标。第 05 章的 shared、fragment、流水线和 `T.gemm` 仍在内层照常
-工作，只是外面多套了一层不规则映射。
+于是 Grouped GEMM 的难点从「怎样做矩阵乘」转到「怎样表示和调度一组不同大小的矩阵乘」：
+packed layout 决定数据如何连续存放，前缀和描述每组的边界，block 映射把线性工作编号还原为
+group 与 tile 坐标。第 05 章的 shared、fragment、流水线和 `T.gemm` 仍在内层照常工作，只是
+外面多套了一层不规则映射。
 
 本章通过一个具体的小组分布逐步把这层映射搭起来，再讨论 padding、空组、分桶和端到端 MoE
-开销。需要特别说明：文中的 `group_idx_for_block` 是这份映射的一项元数据，不是
-TileLang 保证存在的固定 API。这个区别本身有味道——工程设计首先来自工作负载的结构，而不是
-来自某个可调用的函数名。
+开销。先说明一点：文中的 `group_idx_for_block` 是这份映射的一项元数据，不是 TileLang
+保证存在的固定 API。这个区别本身有味道——工程设计首先来自工作负载的结构，而不是某个可
+调用的函数名。
 
 > **本章导航** 高级专项难度，预计 4–6 小时。前置是第 05 章 GEMM、第 07 章布局与高级
 > 指令、第 08 章自动调优。运行范围以 CUDA GPU 为主线，完整性能实验需要支持 `T.gemm`
@@ -51,9 +51,11 @@ expert 3: A3[64, 4096]  × B3[4096, 11008] → C3[64, 11008]
 ```
 
 这四个 expert 的负载明显不均：最小的组只有 7 个 token，最大的组有 128 个 token，相差近
-20 倍。对于只有 7 个 token 的 expert 2，矩阵乘无法充分利用 GPU，调度开销和尾部浪费占比会增加。
+20 倍。只有 7 个 token 的 expert 2，矩阵乘用不满 GPU，调度开销和尾部浪费的占比会往上走。
 
-如果逐组调用 GEMM，就会产生 4 次 kernel 调度；如果每组很小，矩阵乘本身的并行度不足，调度开销和尾部浪费会更加明显。分组 GEMM 的目标是：**保留每组独立的矩阵和结果语义，同时让多个组共享一套 kernel 调度和 tile 逻辑。**
+逐组调用 GEMM 会触发 4 次 kernel 调度；每组又很小，矩阵乘本身的并行度不够，调度开销和尾部
+浪费更明显。分组 GEMM 的目标是：**保留每组独立的矩阵和结果语义，同时让多组共用一套 kernel
+调度和 tile 逻辑。**
 
 ### 13.1.1 它和 batched GEMM 不一样
 
@@ -65,7 +67,8 @@ expert 3: A3[64, 4096]  × B3[4096, 11008] → C3[64, 11008]
 | Batched GEMM | `G` 组相同的 `M/N/K` | 组间形状相同，地址通常有固定 stride | `torch.bmm`、batched library |
 | Grouped GEMM | 第 `g` 组有 `M_g/N_g/K_g`，至少一维可以不同 | 需要额外的组元数据和调度映射 | grouped GEMM kernel |
 
-如果所有组的形状完全相同，优先先考虑 batched GEMM；只有当形状不规则、需要不同指针或需要和路由后的 token 排布结合时，grouped GEMM 才真正体现价值。
+如果所有组的形状完全相同，先考虑 batched GEMM；只有当形状不规则、需要不同指针或要和路由
+后的 token 排布结合时，grouped GEMM 才真正体现价值。
 
 ### 13.1.2 分组 GEMM 在 MoE 中的位置
 
@@ -81,11 +84,13 @@ grouped GEMM：每个 expert 用自己的权重处理自己的 token
 combine/scatter：把结果还原到原始 token 顺序并做权重合并
 ```
 
-因此，不能只报告 grouped GEMM kernel 的延迟就声称整个 MoE 加速了。端到端报告还要说明 token 重排、元数据生成、结果 scatter/reduce 是否计入计时。
+因此，不能只报 grouped GEMM kernel 的延迟就宣布整个 MoE 加速了。端到端报告还要说明 token
+重排、元数据生成、结果 scatter/reduce 有没有计入计时。
 
 ## 13.2 先选一种数据表示
 
-Grouped GEMM 的第一个工程决策不是 tile 大小，而是「矩阵组如何放在内存里」。下面先采用一种适合教学和 MoE 的 packed layout。
+Grouped GEMM 的第一个工程决策不是 tile 大小，而是「矩阵组怎么放在内存里」。下面先采用
+一种适合教学和 MoE 的 packed layout。
 
 ### 13.2.1 Packed layout：把 A 和 C 按行拼接
 
@@ -123,7 +128,9 @@ B_ptrs[g] → B_g
 C_ptrs[g] → C_g
 ```
 
-它适合原始矩阵已经分散在不同内存区域的场景，避免重新 pack；代价是 kernel 内需要做指针加载和地址计算，地址访问也更难统一。TileLang 官方 `examples/grouped_gemm/` 同时提供了常规和 pointer 风格的示例，实际选型要结合上游数据是否已经连续、是否需要额外重排来测量。
+它适合原始矩阵已经分散在不同内存区域的场景，省掉重新 pack；代价是 kernel 内要做指针加载
+和地址计算，地址访问也更难统一。TileLang 官方 `examples/grouped_gemm/` 同时提供了常规和
+pointer 两种示例，实际选型要结合上游数据是否已连续、是否需要额外重排来测量。
 
 ### 13.2.3 主线采用的假设
 
@@ -139,7 +146,8 @@ C_ptrs[g] → C_g
 
 ## 13.3 参考实现：先保证每组结果正确
 
-在写 GPU kernel 之前，先用 host 侧循环建立参考实现。这个版本故意不追求速度，只负责定义结果语义。
+在写 GPU kernel 之前，先用 host 侧循环建立参考实现。这个版本故意不追求速度，只负责定义
+结果语义。
 
 ```python
 import torch
@@ -180,7 +188,8 @@ def grouped_gemm_separate_launches(A_pack, B_stack, row_offsets):
     return result
 ```
 
-这个基线可以用来回答第一个性能问题：**把多个 GEMM 合成一个 grouped kernel，是否只是减少了 kernel launch？** 不一定。除了 launch 次数，还可能改变：
+这个基线回答第一个性能问题：**把多个 GEMM 合成一个 grouped kernel，是否只是减少了
+kernel launch？** 不一定。除了 launch 次数，还可能改变：
 
 - 小矩阵的线程块利用率；
 - `B_g` 的加载和缓存行为；
@@ -191,7 +200,9 @@ def grouped_gemm_separate_launches(A_pack, B_stack, row_offsets):
 
 ## 13.4 最关键的难点：把 block 映射回 group
 
-普通 GEMM 中，`blockIdx.x/y` 可以直接解释为输出 tile 的列/行坐标。Grouped GEMM 中，一个线性 block id 还需要知道它属于哪一组。不能直接把 `blockIdx` 当作 tile 坐标，因为在分组场景里，block 所属的组及其组内位置需要根据各组大小推导。
+普通 GEMM 中，`blockIdx.x/y` 可以直接解释为输出 tile 的列/行坐标。Grouped GEMM 里，一个
+线性 block id 还要先知道它属于哪一组。不能直接把 `blockIdx` 当作 tile 坐标——分组场景下，
+block 属于哪个组、组内位置在哪，要根据各组大小推导。
 
 ### 13.4.1 用每组 tile 数建立前缀和
 
@@ -247,7 +258,8 @@ tile_offsets    = [0, 4, 6, 10]
 | 4～5 | 1 | 0～1 | 0 | 0～1 |
 | 6～9 | 2 | 0～3 | 0～1 | 0～1 |
 
-这个表说明了 grouped GEMM 的核心：**矩阵乘本身仍然是规则 tile；不规则性集中在 block 到 group 的映射和每组尾部尺寸上。**
+这个表点出了 grouped GEMM 的核心：**矩阵乘本身仍然是规则 tile；不规则性集中在 block 到
+group 的映射和每组尾部尺寸上。**
 
 ### 13.4.3 三种实现映射的方式
 
@@ -257,11 +269,14 @@ tile_offsets    = [0, 4, 6, 10]
 | kernel 内二分查找 `tile_offsets` | 每个 block 自己找 `g` | 元数据更小 | 每个 block 多做查找，分支和负载不规则 |
 | padded row mapping | 按 M 方向补齐，记录 `group_padded_offsets` 和 block→group 映射 | 适合 MoE 的 packed token，和行 tile 对齐 | 需要处理 padding 和空组 |
 
-教学和工程实践通常先选第一种。官方 fused-MoE 示例采用了 `group_sizes`、`group_offsets`、`group_padded_offsets` 和 `group_idx_for_bx` 这类元数据，把 M 方向的 block 映射和实际有效行数分开处理。
+教学和工程实践通常先选第一种。官方 fused-MoE 示例用了 `group_sizes`、`group_offsets`、
+`group_padded_offsets` 和 `group_idx_for_bx` 这类元数据，把 M 方向的 block 映射和实际有效
+行数分开处理。
 
 ## 13.5 准备分组元数据
 
-下面的代码只负责在 host 侧计算行 offset、padding offset 和 M 方向 block 的 group id。它不是 GPU kernel，适合先单独测试。
+下面的代码只在 host 侧算行 offset、padding offset 和 M 方向 block 的 group id。它不是 GPU
+kernel，适合先单独测。
 
 ```python
 import torch
@@ -305,7 +320,10 @@ padded_offsets[g+1] - padded_offsets[g] == ceildiv(group_sizes[g], BM) * BM
 group_idx_for_block 的长度 == sum(ceildiv(group_sizes[g], BM))
 ```
 
-当 `group_sizes[g] == 0` 时，`m_blocks[g] == 0`，因此不会生成对应 block。这样做的好处是没有空计算；代价是 kernel 的 group 映射只覆盖非空组。若工程接口要求每个 group 都保留一个工作项，可以给空组分配一个 dummy block，但必须让它在进入 `T.copy`/`T.gemm` 前直接退出或跳过写回，不能对无效地址做读取。
+当 `group_sizes[g] == 0` 时，`m_blocks[g] == 0`，不会生成对应 block。好处是没有空计算；
+代价是 kernel 的 group 映射只覆盖非空组。若工程接口要求每个 group 都保留一个工作项，可以给
+空组分配一个 dummy block，但必须让它在进入 `T.copy`/`T.gemm` 前直接退出或跳过写回，不能对
+无效地址做读取。
 
 ### 13.5.1 A 的 padding 做法
 
@@ -317,13 +335,16 @@ A_padded = [ pad(A0, ceildiv(M0,BM)*BM )
              ... ]
 ```
 
-这样，最后一个 M tile 仍然可以用规则的 `T.copy` 搬进 shared memory；输出时再用 `group_sizes[g]` 保护真实行。补零的原因是：无效行参与 GEMM 时不会污染有效行的结果。
+这样，最后一个 M tile 仍可用规则的 `T.copy` 搬进 shared memory；输出时再用
+`group_sizes[g]` 保护真实行。补零的原因是：无效行参与 GEMM 时不会污染有效行的结果。
 
-生产实现也可以不提前 materialize `A_padded`，而是在最后一个 M tile 中用显式掩码加载有效行、把无效行填 0。这样能减少 padding 的存储，但代码和分支更复杂，必须单独测量。
+生产实现也可以不提前 materialize `A_padded`，而是在最后一个 M tile 里用显式掩码加载有效行、
+把无效行填 0。这样能省 padding 的存储，但代码和分支更复杂，必须单独测量。
 
 ## 13.6 TileLang 内核骨架：规则 tile + 分组映射
 
-下面是一个教学用内核骨架。它展示分组 GEMM 的关键数据流，并省略 host 包装代码和不同后端的边界分支。
+下面是一个教学用内核骨架。它展示分组 GEMM 的关键数据流，省略了 host 包装代码和不同后端
+的边界分支。
 
 **代码前提：**
 
@@ -391,38 +412,45 @@ def grouped_gemm_padded(
 
 ### 13.6.1 逐段理解这段代码
 
-1. **block 到 group**：`bm_id` 先查 `group_idx_for_block`，得到 `group_id`。这是 grouped GEMM 相对于普通 GEMM 新增的第一层索引。
-2. **物理行到逻辑行**：`A_padded` 按补齐后的行排列，`C_pack` 按真实行排列，所以需要用 `padded_offsets` 和 `row_offsets` 做一次坐标转换。
-3. **权重选择**：`B_stack[group_id, ...]` 选择当前 expert 的权重。一个 block 不会访问其他 group 的 `B`。
-4. **K 循环**：组内 GEMM 的 K 维仍然使用第 05 章的 `T.Pipelined`、shared tile、fragment 累加器和 `T.gemm`。
-5. **输出保护**：最后一个 M tile 可能只有一部分真实行，`valid_m` 防止把 padding 结果写回 `C_pack`。
+1. **block 到 group**：`bm_id` 先查 `group_idx_for_block`，得到 `group_id`。这是 grouped
+   GEMM 比普通 GEMM 多出的第一层索引。
+2. **物理行到逻辑行**：`A_padded` 按补齐后的行排列，`C_pack` 按真实行排列，所以要用
+   `padded_offsets` 和 `row_offsets` 做一次坐标转换。
+3. **权重选择**：`B_stack[group_id, ...]` 选出当前 expert 的权重。一个 block 不会访问其他
+   group 的 `B`。
+4. **K 循环**：组内 GEMM 的 K 维仍用第 05 章的 `T.Pipelined`、shared tile、fragment
+   累加器和 `T.gemm`。
+5. **输出保护**：最后一个 M tile 可能只有一部分真实行，`valid_m` 防止把 padding 结果写回
+   `C_pack`。
 
-这说明一个重要事实：**Grouped GEMM 不是把 `T.gemm` 换成另一种乘法，而是在普通 tiled GEMM 外面增加「组选择、地址偏移和尾部管理」。**
+这说清一个重要事实：**Grouped GEMM 不是把 `T.gemm` 换成另一种乘法，而是在普通 tiled GEMM
+外面增加「组选择、地址偏移和尾部管理」。**
 
 ### 13.6.2 不在内层循环反复查 group 的原因
 
-`group_id` 在一个 M tile 内是常量。正确做法是每个 block 只读取一次组编号，然后把它用于：
+`group_id` 在一个 M tile 内是常量。正确做法是每个 block 只读一次组编号，再拿它去：
 
 - 计算 A/C 的行偏移；
 - 选择 B 的 batch 维；
 - 计算有效行数。
 
-不要在 `T.Parallel(block_m, block_n)` 的每个元素里再次搜索 `group_id`。那会把本应是 block 级的元数据开销放大到 element 级，并且使访问和分支更难优化。
+不要在 `T.Parallel(block_m, block_n)` 的每个元素里再次搜索 `group_id`。那会把本应是 block
+级的元数据开销放大到 element 级，访问和分支也更难优化。
 
 ### 13.6.3 这个骨架不直接承诺可运行的原因
 
-Grouped GEMM 的实际签名会受以下因素影响：
+Grouped GEMM 的实际签名受以下因素影响：
 
 - 当前 TileLang 版本对动态 `T.Tensor` 维度和 3D `T.copy` 的支持；
 - 目标后端对 `T.gemm` 输入布局和 `transpose_B` 的要求；
 - grid 维度是按当前输入编译，还是采用上限网格加 active guard；
 - 是否启用 warp specialization、TMA 或特定的 layout policy。
 
-因此，阅读这段代码时先检查索引和数据流，再对照当前版本的 [官方 grouped GEMM 示例](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm) 调整 API。能通过 AST 语法检查不等于能在任意 GPU、任意 TileLang wheel 上编译。
+因此，读这段代码时先检查索引和数据流，再对照当前版本的 [官方 grouped GEMM 示例](https://github.com/tile-ai/tilelang/tree/main/examples/grouped_gemm) 调整 API。能通过 AST 语法检查，不等于能在任意 GPU、任意 TileLang wheel 上编译。
 
 ## 13.7 边界条件：正确性比吞吐更优先
 
-Grouped GEMM 最容易出现的错误不是矩阵乘公式写错，而是组边界和 padding 处理错。
+Grouped GEMM 最容易出的错，不是矩阵乘公式写错，而是组边界和 padding 处理错。
 
 ### 13.7.1 M 方向尾部
 
@@ -434,13 +462,15 @@ Grouped GEMM 最容易出现的错误不是矩阵乘公式写错，而是组边�
 
 ### 13.7.2 K 方向尾部
 
-若 `K` 不是 `BK` 的倍数，最后一个 K tile 需要把无效列填 0。否则，A/B 的无效元素会参与乘加，结果会被污染。可选方案：
+若 `K` 不是 `BK` 的倍数，最后一个 K tile 要把无效列填 0。否则 A/B 的无效元素会参与乘加，
+结果被污染。可选方案：
 
 1. host 侧把 K padding 到 `BK` 的倍数；
 2. 每轮先 `T.clear(A_shared/B_shared)`，再用 guarded load 写有效元素；
-3. 为整除尺寸和尾部尺寸分别选择不同的专用 kernel。
+3. 为整除尺寸和尾部尺寸分别选不同的专用 kernel。
 
-不要因为 `T.copy` 可能插入 safe-access guard，就默认越界输入会自动变成 0。边界保护和无效元素的数值语义是两件事。
+不要因为 `T.copy` 可能插入 safe-access guard，就默认越界输入会自动变成 0。边界保护和无效
+元素的数值语义是两件事。
 
 ### 13.7.3 空组
 
@@ -449,11 +479,14 @@ Grouped GEMM 最容易出现的错误不是矩阵乘公式写错，而是组边�
 - 在 metadata 阶段过滤空组，但保留原始 `group_id`；
 - 为每个空组保留一个 dummy 工作项，在 kernel 中直接跳过读写。
 
-第一种通常减少无效工作，第二种更容易保持固定的组编号表。无论采用哪种方式，都要测试「全部为空」「中间为空」和「最后为空」。
+第一种通常减少无效工作，第二种更容易保持固定的组编号表。无论哪种，都要测试「全部为空」
+「中间为空」和「最后为空」。
 
 ### 13.7.4 N/K 不同的组
 
-本章主线假设各组共享 `N/K`。如果不同组连 `N/K` 也不同，单个规则 `T.gemm` 骨架就不再适用。工程上通常先按 `(N, K, dtype, transpose)` 分桶，再对每个 bucket 调用专用 grouped kernel；形状极少时也可以退回逐组调用库。
+本章主线假设各组共享 `N/K`。如果不同组连 `N/K` 也不同，单个规则 `T.gemm` 骨架就用不上了。
+工程上通常先按 `(N, K, dtype, transpose)` 分桶，再对每个 bucket 调专用 grouped kernel；
+形状极少时也可以退回逐组调用库。
 
 ## 13.8 性能分析：不要只看 kernel 延迟
 
@@ -461,13 +494,15 @@ Grouped GEMM 的性能报告至少要有两种口径：
 
 ### 13.8.1 Kernel-only
 
-把 pack、metadata、dispatch 和输出 scatter 都放在计时区间外，只测 grouped kernel 与逐组 GEMM 的 GPU 执行时间。它回答的是：**内核调度和 tile 组织本身是否有效？**
+把 pack、metadata、dispatch 和输出 scatter 都放在计时区间外，只测 grouped kernel 与逐组
+GEMM 的 GPU 执行时间。它回答的是：**内核调度和 tile 组织本身是否有效？**
 
 ### 13.8.2 End-to-end
 
 把上游 token 重排、metadata 构造、kernel、结果恢复都计入。它回答的是：**在真实模型路径里，这个设计是否值得？**
 
-两者差距很大时，继续调 `BM/BN` 往往收效有限；更应先减少重复 pack、缓存稳定 metadata，或把 dispatch/grouped GEMM/combine 做更紧的融合。
+两者差距很大时，继续调 `BM/BN` 往往收效有限；更应先减少重复 pack、缓存稳定 metadata，
+或把 dispatch/grouped GEMM/combine 做更紧的融合。
 
 ### 13.8.3 有效 FLOPs 和 padding FLOPs
 
@@ -499,7 +534,8 @@ $$
 M 方向利用率   = 231 / 512 ≈ 45.1%
 ```
 
-这只是 M 方向的利用率，不等于最终 TFLOPS；但它能帮助解释「为什么一个看似减少 launch 的 grouped kernel 仍然不快」。
+这只是 M 方向的利用率，不等于最终 TFLOPS；但它能帮你解释「为什么一个看似减少 launch 的
+grouped kernel 仍然不快」。
 
 ### 13.8.4 TFLOPS 口径
 
@@ -509,7 +545,8 @@ M 方向利用率   = 231 / 512 ≈ 45.1%
 TFLOPS = 2 * sum(M_g * K * N) / latency_ms / 1e9
 ```
 
-对于 padding kernel，建议同时报告 useful TFLOPS 和 padded TFLOPS，避免用「包含无效行的计算量」掩盖真实利用率。
+对于 padding kernel，建议同时报 useful TFLOPS 和 padded TFLOPS，别用「包含无效行的计算量」
+掩盖真实利用率。
 
 ## 13.9 优化路线：一次只改变一个变量
 
@@ -540,7 +577,8 @@ TFLOPS = 2 * sum(M_g * K * N) / latency_ms / 1e9
 - `BM` 太小：大组的 tile 数增多，Tensor Core 和数据搬运效率可能下降；
 - `stages` 太多：大组可能受益，小组却可能被 shared/register 开销拖慢。
 
-分桶的思路是先把形状相近的 group 放到一起，再在每个 bucket 内调参。它增加了调度和 metadata 管理，但通常比让一个 kernel 适配所有极端形状更可控。
+分桶的思路是先把形状相近的 group 放到一起，再在每个 bucket 内调参。它多了调度和 metadata
+管理，但通常比让一个 kernel 适配所有极端形状更可控。
 
 ## 13.10 调试清单
 

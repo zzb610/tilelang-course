@@ -43,7 +43,7 @@ O = P @ V                  # [B,H,N,d]
 S/P 落盘。需要精确一点的是，它并非把所有 Attention 的 HBM IO 变成 O(N)——更准确的 IO 上界
 依赖片上存储容量，常见表达为 O(N²·d²/M)，并额外包含 Q/K/V/O 的线性项。
 
-于是核心结论落在这里：FlashAttention 减少了 HBM 往返，并避免把完整的 `S/P` 中间矩阵落盘；
+核心结论是：FlashAttention 减少了 HBM 往返，并避免把完整的 `S/P` 中间矩阵落盘；
 但它是否更快、是否受访存限制，仍取决于序列长度、head_dim、GPU、实现和 profiler 结果。
 
 ## 6.2 在线 softmax：数学推导（必会）
@@ -66,11 +66,11 @@ m_new   = max(m_prev, m_local)
 l_new   = l_prev · exp(m_prev − m_new) + l_local · exp(m_local − m_new)
 ```
 
-关键还要处理输出：因为归一化的分母换了，老块的每个输出行向量 `O_prev` 都要乘上
-`exp(m_prev − m_new)`。推导一句话概括：**归一化变了，分母换了，旧的分子乘上「换分母的
+关键还要处理输出：归一化的分母换了，老块的每个输出行向量 `O_prev` 都要乘上
+`exp(m_prev − m_new)`。一句话概括：**归一化变了，分母换了，旧的分子乘上「换分母的
 修正因子」就行**——不用重读任何东西。
 
-这个更新只需要乘一个标量，原因可以从代数上得到。softmax 的分子是 `exp(s_j − m)`；最大值
+这个更新只乘一个标量，代数上能直接看出来。softmax 的分子是 `exp(s_j − m)`；最大值
 更新后，已有分子都要乘上 `exp(m_old − m_new)`，才能保持相同的归一化比例。
 
 在 TileLang 的实现里（官方 `example_mha_fwd_bshd.py`），每轮做的工作正好对应上面三步：
@@ -102,8 +102,8 @@ for i, j in T.Parallel(block_M, dim):
 ```
 
 > 细节：`scale = (1/√d)·log2(e)`，配合 `T.exp2` 把 `/√d` 和 `exp` 都变成
-> `exp2(x·scale)` 一次计算——把缩放和指数变换放到同一表达式中。它是一个值得通过
-> 生成代码和数值测试确认的实现细节，不应脱离目标后端夸大收益。
+> `exp2(x·scale)` 一次计算——把缩放和指数变换放到同一表达式中。它值得通过
+> 生成代码和数值测试确认；不要脱离目标后端夸大它的收益。
 
 ## 6.3 TileLang 实现：完整代码
 
@@ -264,12 +264,12 @@ print(f"{2 * 2 * B * H * N * N * D / lat / 1e9:.1f} TFLOPS")
 
 ## 6.4 反向传播：为什么「重计算」
 
-前向为了省显存而不落盘 `S` 和 `P`，反向却恰恰需要 `P` 和 `S` 来求 `dV、dK、dQ`，这个
-矛盾是理解反向的起点。FlashAttention 的做法（官方 bwd 示例 `example_mha_bwd_bshd.py`
-等）是：**反向时用同样的分块循环重算 S/P**（用保存的 `logsum` 或 `lse`），再算
-`dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于实现和融合方式，换来 O(N²) 中间
-张量的显存节省与更少的 HBM 往返——在长序列上通常值得。因此解释反向时，应同时说明重计算、
-显存占用和实际运行时间之间的权衡，而不是只讲其中一面。
+前向为了省显存而不落盘 `S` 和 `P`，反向却恰恰需要 `P` 和 `S` 来求
+`dV、dK、dQ`——这个矛盾是理解反向的起点。FlashAttention 的做法（官方 bwd 示例
+`example_mha_bwd_bshd.py` 等）是：**反向时用同样的分块循环重算 S/P**（用保存的
+`logsum` 或 `lse`），再算 `dV、dK、dQ`。代价是额外重计算，具体 FLOPs 比例取决于实现和
+融合方式，换来 O(N²) 中间张量的显存节省与更少的 HBM 往返——在长序列上通常值得。所以解释
+反向时，要同时说明重计算、显存占用和实际运行时间之间的权衡，而不是只讲其中一面。
 
 ## 6.5 变长序列（varlen）：从 padding 到 packed layout
 
@@ -328,9 +328,9 @@ k_end   = cu_seqlens_k[b + 1]
 Lk      = k_end - k_start
 ```
 
-因此，原来 dense 布局中的 `Q[b, i, h, d]`，在 packed 布局中变成
+因此，原来 dense 布局中的 `Q[b, i, h, d]`，在 packed 布局里变成
 `Q_unpad[q_start + i, h, d]`；`K` 和 `V` 同理。注意：`cu_seqlens` 存的是**边界偏移**，
-不是每条序列的长度；长度必须通过相邻元素相减得到。
+不是每条序列的长度；长度要靠相邻元素相减得到。
 
 ### 6.5.2 用一个小例子读懂 `cu_seqlens`
 
@@ -399,11 +399,11 @@ O_unpad[q_pack, h, d] = 第 b 条序列的输出 O[i, h, d]
 
 在得到 `q_start`、`k_start` 后，普通 FlashAttention 的两层循环仍然保留，只是全局
 切片从 `bx * block_M` 改成 `q_start + bx * block_M`，从 `k * block_N` 改成
-`k_start + k * block_N`。你可能会问：为什么不直接比较 `q_local` 和 `k_local`，非要多加
-一层 `q_start`/`k_start` 偏移？因为 `q_local` 和 `k_local` 都只是「本样本内部」的局部坐标，
-一旦多条样本 packed 进同一块连续内存，局部坐标相同的两个位置在物理地址上根本不在同一条
-序列里——不借助前缀和把局部坐标抬到 packed 全局坐标，后面的掩码判断就会漏掉别的样本。
-网格的 query 方向使用 `max_seqlen_q` 作为上界，而不是把所有样本都错误地当成
+`k_start + k * block_N`。也许你会问：为什么不直接比较 `q_local` 和 `k_local`，非要多加
+一层 `q_start`/`k_start` 偏移？因为 `q_local` 和 `k_local` 都只是「本样本内部」的局部坐标。
+多条样本 packed 进同一块连续内存后，局部坐标相同的两个位置在物理地址上根本不在同一条
+序列里。不借助前缀和把局部坐标抬到 packed 全局坐标，后面的掩码判断就会漏掉别的样本。
+网格的 query 方向以 `max_seqlen_q` 作为上界，而不是把所有样本都当成
 `max_seqlen_q` 长度。
 
 ### 6.5.4 TileLang 内核骨架：偏移量放在哪里
@@ -414,7 +414,7 @@ O_unpad[q_pack, h, d] = 第 b 条序列的输出 O[i, h, d]
 
 这里的 `UQ`、`UKV` 表示本次编译实例的 packed 总长度；`max_seqlen_q` 和
 `max_seqlen_k` 是长度上界。TileLang 不同版本对动态 shape、边界 copy 和 pipeline
-的支持可能有差异，因此请把这段当成**内核结构示意**，实际运行时以当前仓库官方示例
+的支持可能有差异，所以请把这段当成**内核结构示意**，实际运行时以当前仓库官方示例
 为准，不要只复制接口名称。
 
 ```python
@@ -554,8 +554,8 @@ packed 起点。也就是说，**变的是数据访问边界，不是 softmax �
 
 注意，示意代码中的整块 `T.copy` 依赖当前 TileLang 版本和目标后端对越界 slice 的安全处理。
 如果你的版本不会自动做 predicated copy，就必须改成带 mask 的 copy、先把输入 pad 到 tile
-边界，或用显式循环保护每一个全局地址；仅仅在后面的 softmax mask 中标记无效位置，不能
-阻止一次已经发生的越界加载。
+边界，或用显式循环保护每一个全局地址；只在后面的 softmax mask 中标记无效位置，拦不住
+一次已经发生的越界加载。
 
 ### 6.5.5 causal mask：长度不同时必须先选对齐语义
 
@@ -566,10 +566,10 @@ q_local >= k_local
 ```
 
 但在推理 decode 中，query 可能只有最近的 `Lq` 个 token，而 K/V 已经包含 `Lk` 个历史
-token，此时直接比较局部坐标会把 query 错误地当成从序列开头开始。你难免会问：既然只是
+token，此时直接比较局部坐标会把 query 错误地当成从序列开头开始。也许你会问：既然只是
 比较两个局部坐标，为什么长度一变就失效了？因为 `q_local >= k_local` 暗中假设 query 和
 key 从同一个位置起算；一旦 `Lq != Lk`，query 已经被右对齐到 KV 尾部，它的局部下标 0
-对应的是完整序列里的 `offset` 位置。如果不先加上这个偏移，比较使用的就不是正确的序列位置。常见的
+对应的是完整序列里的 `offset` 位置。不先加上这个偏移，比较用的就不是正确的序列位置。常见的
 右对齐语义是：
 
 ```text
@@ -722,7 +722,7 @@ Attention 配对利用率 = 37 / 50 = 74%
 2. **硬件约束**：Hopper 的 `wgmma.mma_async` 把 4 个 warp（128 线程）绑成一个 warpgroup，
    且要求 M ≥ 64。于是一个 warpgroup 至少要持有 64×512 的累加器——放不下，寄存器溢出后性能断崖。
 3. **解法**：`T.gemm` 的 `policy=T.GemmWarpPolicy.FullCol` 把输出沿 dim 维切给两个
-   warpgroup（各持 64×256），同时该 policy 把约束**反向传播**：`P@V` 的每个 warpgroup
+   warpgroup（各持 64×256）。这个 policy 还会把约束**反向传播**：`P@V` 的每个 warpgroup
    需要完整的 `acc_s`，于是 staging buffer `S_shared` 也必须是 `[BM, BN]`，而 `Q@K` 阶段
    每个 warpgroup 只算一半的 score slab。两个 warpgroup 各自写出一半 `acc_s`，再经
    `S_shared` 交换补齐——**这一段数据交换由布局推断自动生成，你只需要选 policy、写数学**。
@@ -735,8 +735,8 @@ Attention 配对利用率 = 37 / 50 = 74%
 应重跑官方 [FlashMLA 教程](https://tilelang.com/deeplearning_operators/deepseek_mla.html)，
 并单独记录 tile、policy、warpgroup 数与生成源码。
 
-这节想传递的结论是：**当寄存器不够时，改的不是数学，而是 warp policy 与 staging**；
-这里可以看到第 07 章所述布局推断的实际作用：选择 policy 后，编译器生成相应的数据交换代码。
+结论是：**当寄存器不够时，改的不是数学，而是 warp policy 与 staging**。
+这也正是第 07 章布局推断的实际作用——选择 policy 后，编译器生成相应的数据交换代码。
 
 ### 6.5.9 先按语义选示例，不按文件名复制
 
@@ -768,11 +768,11 @@ IO 仍取决于片上容量和 tile 设计。支撑这个结论的三个公式�
 `[total_tokens, H, D]`，用 `cu_seqlens` 找到每条样本的起止偏移，并在每个 tile 中使用实际
 `q_len/k_len`；其正确性关键是三件事——packed 地址、query/key 尾部 guard、`Lq != Lk` 时的
 causal 对齐，性能评估还要把 pack/unpack 开销和 kernel-only 时间分开。最后记住反向靠重计算，
-而 `exp2(x·scale)` 融合 `1/√d` 是需要理解的实现细节，因为它同时影响数值表达和指令路径。
+而 `exp2(x·scale)` 融合 `1/√d` 这个实现细节必须理解，因为它同时影响数值表达和指令路径。
 
 ## 6.7 动手任务
 
-下面的任务用于检验是否能够独立推导并应用 online softmax：
+下面这些任务，检验你能不能独立推导并应用 online softmax：
 
 1. 用 `[1, 2, 3, 4]` 分两块手算 `m_new`、`l_new` 和旧输出缩放因子；
 2. 以 `N=17`、`D=32` 为边界设计题：列出 Q/K/V tile 的 padding、mask 和输出 guard，
